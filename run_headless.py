@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""
+run_headless.py  --  run the full variant-calling pipeline without the web UI.
+
+Useful for debugging the pipeline end-to-end before polishing the dashboard.
+Prints every event to stdout so you can see exactly what's happening.
+
+Usage:
+    AWS_PROFILE=aws uv run python run_headless.py
+
+Optional env vars:
+    SAMPLE_COUNT=5         override config.py for a quick test run
+    SAMPLES_PER_GROUP=3    balanced N-per-super-population draw (AFR/EUR/EAS)
+"""
+
+from __future__ import annotations
+
+import contextlib
+import importlib.util
+import json
+import os
+import sys
+import time
+
+if importlib.util.find_spec("config") is None:
+    sys.exit("config.py not found — copy config.example.py to config.py and fill it in.")
+
+import config as cfg  # type: ignore[import]
+
+# Allow quick override for testing
+sample_count_override = os.environ.get("SAMPLE_COUNT")
+if sample_count_override:
+    cfg.SAMPLE_COUNT = int(sample_count_override)
+
+
+def emit(event: dict) -> None:
+    ts = time.strftime("%H:%M:%S")
+    t = event.get("type", "?")
+
+    if t == "phase":
+        print(f"  [{ts}] PHASE    {event['label']}")
+    elif t == "quota":
+        print(f"  [{ts}] QUOTA    {event['summary']}")
+    elif t == "head_launched":
+        print(f"  [{ts}] LAUNCHED head={event['instance_id']}")
+    elif t == "progress":
+        done = event.get("tasks_done", 0)
+        total = event.get("tasks_total", 0)
+        run = event.get("tasks_running", 0)
+        cost = event.get("ec2_cost_usd", 0)
+        bam = event.get("bam_gb", 0)
+        print(
+            f"  [{ts}] PROGRESS {done}/{total} tasks · {run} running · "
+            f"${cost:.4f} · BAM {bam:.2f} GB"
+        )
+    elif t == "model":
+        state = event.get("state", "")
+        if state == "start":
+            print(f"  [{ts}] MODEL    {event['label']} started")
+        elif state == "done":
+            cost = event.get("cost", 0)
+            print(f"  [{ts}] MODEL    {event['label']} done · ${cost:.6f}")
+    elif t == "insight":
+        print(f"\n  [{ts}] INSIGHT\n")
+        for line in event["text"].splitlines():
+            print(f"    {line}")
+        print()
+    elif t == "cost":
+        print(f"  [{ts}] COST     total=${event['total']:.6f}")
+    elif t == "done":
+        print(f"\n  [{ts}] ✓ DONE\n")
+    elif t == "error":
+        print(f"\n  [{ts}] ✗ ERROR  {event['message']}\n", file=sys.stderr)
+    else:
+        print(f"  [{ts}] {t.upper():8} {json.dumps(event)[:120]}")
+
+    sys.stdout.flush()
+
+
+def main() -> None:
+    from src.omics_demo import agent, nextflow_config, pipeline, spawn, truffle, worker_script
+    from src.omics_demo.accessions import GENOMES_1000_SAMPLES, select_balanced
+
+    print("\n=== 1000 Genomes Variant Calling Demo — Headless Run ===")
+    print(f"  Region:       {cfg.REGION}")
+    print(f"  Bucket:       {cfg.BUCKET}")
+    print(f"  AMI:          {cfg.AMI_ID}")
+    print(f"  Sample count: {cfg.SAMPLE_COUNT}")
+    print()
+
+    # 0. Validate config + clear stale S3 results
+    ami = getattr(cfg, "AMI_ID", "")
+    if not ami:
+        sys.exit("ERROR: AMI_ID is not set in config.py — run `make ami` first.")
+
+    emit({"type": "phase", "label": "Clearing stale S3 results…"})
+    with contextlib.suppress(Exception):
+        pipeline.clear_results(cfg)
+
+    # 1. Quota
+    emit({"type": "phase", "label": "Querying vCPU quotas via truffle…"})
+    inst_types = nextflow_config.all_instance_types(cfg)  # arch-aware (cfg.BENCH_ARCH)
+    families = list({t.split(".")[0] for t in inst_types})
+    quotas = truffle.query_quotas(cfg.REGION, families)
+    queue_size = truffle.derive_queue_size(quotas, inst_types, cfg.REGION)
+    emit(
+        {
+            "type": "quota",
+            "queue_size": queue_size,
+            "summary": truffle.quota_summary(quotas, queue_size),
+        }
+    )
+
+    # 2. Ensure bucket
+    emit({"type": "phase", "label": f"Ensuring S3 bucket s3://{cfg.BUCKET}…"})
+    import boto3
+    from botocore.exceptions import ClientError
+
+    s3 = boto3.client("s3", region_name=cfg.REGION)
+    try:
+        if cfg.REGION == "us-east-1":
+            s3.create_bucket(Bucket=cfg.BUCKET)
+        else:
+            s3.create_bucket(
+                Bucket=cfg.BUCKET, CreateBucketConfiguration={"LocationConstraint": cfg.REGION}
+            )
+    except ClientError as e:
+        if e.response["Error"]["Code"] not in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
+            raise
+
+    # 3. Upload configs
+    emit({"type": "phase", "label": "Uploading sample list and Nextflow config…"})
+    # Sample selection, in priority order:
+    #  1. SAMPLES_PER_GROUP=N — balanced N-per-super-population draw from
+    #     GENOMES_1000_SAMPLES (super-populations: AFR / EUR / EAS). This is the
+    #     science draw — equal groups so population-differentiation QC + per-stage
+    #     arch stats are balanced. e.g. SAMPLES_PER_GROUP=10 → 30 samples, 10/group.
+    #  2. config.py SAMPLES_PER_GROUP — same balanced draw from config.
+    #  3. default — GENOMES_1000_SAMPLES[:SAMPLE_COUNT].
+    per_group = os.environ.get("SAMPLES_PER_GROUP") or getattr(cfg, "SAMPLES_PER_GROUP", "")
+    if per_group:
+        n = int(per_group)
+        samples = select_balanced(n)
+        sample_count = len(samples)
+        ngroups = len({s[2] for s in samples})
+        emit(
+            {
+                "type": "phase",
+                "label": f"Balanced draw: {n}/group × {ngroups} pops = {sample_count} samples",
+            }
+        )
+    else:
+        sample_count = min(cfg.SAMPLE_COUNT, len(GENOMES_1000_SAMPLES))
+        samples = GENOMES_1000_SAMPLES[:sample_count]
+    srr_key = worker_script.write_srr_slice(cfg, samples)
+    pipeline.write_samples_csv(cfg, samples)
+    nf_cfg_str = nextflow_config.render(cfg, queue_size)
+    nf_cfg_key = worker_script.upload_nextflow_config(cfg, nf_cfg_str)
+    main_nf_key = worker_script.upload_main_nf(cfg)
+    emit(
+        {"type": "phase", "label": f"Config ready — queueSize={queue_size}, {sample_count} samples"}
+    )  # noqa: E501
+
+    # 4. Launch head
+    emit({"type": "phase", "label": "Launching Nextflow head instance (t4g.small)…"})
+    import types
+
+    head_cfg = types.SimpleNamespace(
+        **{k: getattr(cfg, k) for k in dir(cfg) if not k.startswith("_")}
+    )
+    head_cfg.INSTANCE_TYPE = getattr(cfg, "HEAD_INSTANCE_TYPE", "t4g.small")
+    head_cfg.INSTANCE_COUNT = 1
+
+    # Reference delivery is zero-copy via the single s3:// reference marker +
+    # nf-spawn ext.fsx/ext.volumes symlink (nf-spawn#55): main.nf points
+    # params.reference at an s3:// marker (same filesystem as the s3:// workDir →
+    # no head-side foreign copy), and each CALL_VARIANTS task symlinks the staged
+    # input to its mounted FSx/EBS reference. So the head no longer needs the
+    # reference volume attached for validation — the marker satisfies main.nf's
+    # path-exists check. Write the single reference marker now.
+    pipeline.write_reference_marker(cfg)
+    emit(
+        {
+            "type": "phase",
+            "label": "Wrote s3:// reference marker (zero-copy reference via ext.fsx/ext.volumes)",
+        }
+    )
+    head_cfg.HEAD_ATTACH_VOLUMES = []
+
+    head_script = worker_script.render(cfg, nf_cfg_key, srr_key, main_nf_key)
+    head_script_path = worker_script.write_temp(head_script)
+    wg = spawn.launch_workers(head_cfg, head_script_path, emit=emit)
+    head_id = wg.instance_ids[0] if wg.instance_ids else None
+    start_time = time.time()
+    emit({"type": "head_launched", "instance_id": head_id})
+
+    # 5. Poll + 6. Synthesis — wrapped so the s3:// reference marker is always
+    # cleaned up (every exit path: completion, timeout, head failure, no summary).
+    try:
+        print(f"\n  Polling every 15s (head={head_id})...\n")
+        max_polls = (90 * 60) // 15
+        for poll in range(max_polls):
+            time.sleep(15)
+
+            # Use S3 progress.json for completion detection (workaround for spawn#26).
+            pipeline_done = pipeline.is_pipeline_complete(cfg)
+
+            if head_id:
+                statuses = spawn.poll_workers([head_id])
+                head_status = statuses.get(head_id, "running")
+                if head_status == "failed":
+                    emit({"type": "error", "message": "Head instance failed."})
+                    sys.exit(1)
+
+            prog = pipeline.poll_progress(cfg, start_time, queue_size)
+            emit(
+                {
+                    "type": "progress",
+                    "tasks_done": prog.tasks_done,
+                    "tasks_total": prog.tasks_total,
+                    "tasks_running": prog.tasks_running,
+                    "ec2_cost_usd": prog.ec2_cost_usd,
+                    "elapsed_seconds": prog.elapsed_seconds,
+                    "bam_gb": prog.data.bam_gb,
+                    "vcf_gb": prog.data.vcf_gb,
+                }
+            )
+
+            if pipeline_done:
+                emit({"type": "phase", "label": "Nextflow complete. Building summary…"})
+                break
+
+            if (poll + 1) % 4 == 0:
+                emit(
+                    {
+                        "type": "phase",
+                        "label": f"{prog.tasks_done}/{prog.tasks_total} tasks · "
+                        f"{prog.elapsed_seconds / 60:.1f} min elapsed",
+                    }
+                )
+        else:
+            emit({"type": "error", "message": "Timed out after 90 minutes."})
+            sys.exit(1)
+
+        # 6. Synthesis
+        summary = pipeline.read_summary(cfg)
+        if summary:
+            agent.synthesize(summary, emit)
+        else:
+            emit({"type": "error", "message": "No summary.json found in S3."})
+            sys.exit(1)
+    finally:
+        # Always remove this job's s3:// reference marker.
+        with contextlib.suppress(Exception):
+            pipeline.clear_reference_marker(cfg)
+            emit({"type": "phase", "label": "Cleaned up s3:// reference marker."})
+
+
+if __name__ == "__main__":
+    main()

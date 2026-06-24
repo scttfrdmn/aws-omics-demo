@@ -1,0 +1,631 @@
+"""
+app.py  --  FastAPI backend for the 1000 Genomes variant-calling dashboard.
+
+Architecture:
+  - Queries vCPU quotas via truffle before launch.
+  - Launches ONE small Nextflow head instance (t4g.small) via spawn.
+  - The head instance runs the custom bcftools variant-calling pipeline
+    (CALL_VARIANTS → MERGE_VCFS → VCF_STATS) with the nf-spawn executor,
+    dispatching each pipeline task to its own ephemeral EC2 instance.
+  - Polls progress.json from S3 every 15 s and streams events over WebSocket.
+
+Fake mode:
+  Set DEMO_FAKE=1 to run without any AWS calls — simulates the full pipeline
+  with scripted events and delays.  Useful for rehearsing the UI.
+
+WebSocket event protocol:
+  { "type": "phase",    "label": str }
+  { "type": "quota",    "queue_size": int, "summary": str }
+  { "type": "head_launched", "instance_id": str }
+  { "type": "progress", "tasks_done": int, "tasks_total": int,
+                         "tasks_running": int, "queue_size": int,
+                         "concurrency_pct": float, "completion_pct": float,
+                         "ec2_cost_usd": float, "elapsed_seconds": float,
+                         "bam_gb": float, "vcf_gb": float,
+                         "compression_ratio": float,
+                         "variant_counts": dict }
+  { "type": "model",    "tier": str, "label": str, "state": "start"|"done",
+                         "usage"?: dict, "cost"?: float }
+  { "type": "insight",  "text": str }
+  { "type": "cost",     "total": float }
+  { "type": "done" }
+  { "type": "error",    "message": str }
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import importlib.util
+import json
+import os
+import sys
+import threading
+import time
+import webbrowser
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+
+# DEMO_FAKE=1 → run without AWS calls (for rehearsal / UI testing)
+_FAKE = os.environ.get("DEMO_FAKE") == "1"
+
+if _FAKE:
+    # In fake mode, create a minimal config stub so the rest of the module
+    # can reference cfg.* without importing the real config.py.
+    import types as _types
+
+    cfg = _types.SimpleNamespace(  # type: ignore[assignment]
+        REGION="us-east-1",
+        BUCKET="demo-fake-bucket",
+        SAMPLE_COUNT=100,
+        JOB_NAME="omics-demo",
+        AMI_ID="ami-fake",
+        INSTANCE_TTL="3h",
+        HEAD_INSTANCE_TYPE="t4g.small",
+        BEDROCK_REGION="us-west-2",
+        BEDROCK_MODEL="us.anthropic.claude-sonnet-4-6",
+        HOST="127.0.0.1",
+        PORT=8000,
+    )
+else:
+    if importlib.util.find_spec("config") is None:
+        sys.exit("config.py not found — copy config.example.py to config.py and fill it in.")
+    import config as cfg  # type: ignore[import]  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
+
+_STATE: dict[str, Any] = {
+    "status": "idle",  # idle | running | complete | error
+    "run_id": None,
+    "start_time": None,
+    "head_instance_id": None,
+    "queue_size": 0,
+    "progress": None,
+    "summary": None,
+    "error": None,
+}
+
+_SUBSCRIBERS: list[asyncio.Queue] = []
+_STATE_LOCK = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
+_launch_config: dict[str, Any] = {"url": None, "opened": False}
+
+
+@asynccontextmanager
+async def _lifespan(application: FastAPI):  # noqa: ARG001
+    url = _launch_config.get("url")
+    if url and not _launch_config["opened"]:
+        _launch_config["opened"] = True
+        webbrowser.open(url)
+    yield
+
+
+app = FastAPI(title="1000 Genomes Variant Calling Demo", lifespan=_lifespan)
+
+_STATIC_DIR = Path(__file__).parent / "static"
+app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
+
+# ---------------------------------------------------------------------------
+# HTTP routes
+# ---------------------------------------------------------------------------
+
+
+@app.get("/", include_in_schema=False)
+async def serve_index():
+    return FileResponse(str(_STATIC_DIR / "index.html"))
+
+
+@app.post("/api/start")
+async def start_run():
+    """Launch the pipeline (or fake pipeline).  Idempotent if already running."""
+    with _STATE_LOCK:
+        if _STATE["status"] == "running":
+            return {"status": "already_running", "run_id": _STATE["run_id"]}
+
+        _STATE["status"] = "running"
+        _STATE["run_id"] = f"run-{int(time.time())}"
+        _STATE["start_time"] = time.time()
+        _STATE["head_instance_id"] = None
+        _STATE["queue_size"] = 0
+        _STATE["progress"] = None
+        _STATE["summary"] = None
+        _STATE["error"] = None
+
+    target = _run_fake_pipeline if _FAKE else _run_pipeline
+    threading.Thread(target=target, daemon=True).start()
+    return {"status": "started", "run_id": _STATE["run_id"], "fake": _FAKE}
+
+
+@app.get("/api/status")
+async def get_status():
+    with _STATE_LOCK:
+        return {
+            "status": _STATE["status"],
+            "run_id": _STATE["run_id"],
+            "queue_size": _STATE["queue_size"],
+            "progress": _STATE["progress"],
+            "fake": _FAKE,
+        }
+
+
+@app.get("/api/results")
+async def get_results():
+    with _STATE_LOCK:
+        summary = _STATE.get("summary")
+    if summary is None:
+        return JSONResponse({"error": "results not ready"}, status_code=404)
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# WebSocket
+# ---------------------------------------------------------------------------
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket):
+    await ws.accept()
+    queue: asyncio.Queue = asyncio.Queue()
+    _SUBSCRIBERS.append(queue)
+
+    with _STATE_LOCK:
+        status = _STATE["status"]
+        progress = _STATE["progress"]
+
+    if status == "running" and progress:
+        await ws.send_text(json.dumps({"type": "status_snapshot", **progress}))
+    elif status == "complete":
+        summary = _STATE.get("summary")
+        if summary:
+            await ws.send_text(json.dumps({"type": "summary", **summary}))
+
+    try:
+        while True:
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=30)
+                await ws.send_text(json.dumps(event))
+            except TimeoutError:
+                await ws.send_text(json.dumps({"type": "heartbeat"}))
+    except WebSocketDisconnect:
+        pass
+    finally:
+        _SUBSCRIBERS.remove(queue)
+
+
+def _broadcast(event: dict) -> None:
+    for q in list(_SUBSCRIBERS):
+        with contextlib.suppress(Exception):
+            q.put_nowait(event)
+
+
+# ---------------------------------------------------------------------------
+# Config validation
+# ---------------------------------------------------------------------------
+
+
+def _validate_config(config) -> str | None:
+    """Return an error message if config is invalid, else None."""
+    ami = getattr(config, "AMI_ID", "")
+    if not ami:
+        return "AMI_ID is not set in config.py — run `make ami` first."
+
+    bucket = getattr(config, "BUCKET", "")
+    if not bucket or bucket == "your-omics-demo-bucket":
+        return "BUCKET is not configured in config.py — set it to your S3 bucket name."
+
+    region = getattr(config, "REGION", "")
+    valid_prefixes = ("us-", "eu-", "ap-", "ca-", "sa-", "me-", "af-")
+    if not region or not any(region.startswith(p) for p in valid_prefixes):
+        return f"REGION '{region}' looks invalid in config.py."
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Real pipeline runner (background thread)
+# ---------------------------------------------------------------------------
+
+
+def _run_pipeline() -> None:
+    from . import agent, nextflow_config, pipeline, spawn, truffle, worker_script
+    from .accessions import GENOMES_1000_SAMPLES, select_balanced
+
+    def emit(event: dict) -> None:
+        _broadcast(event)
+        if event.get("type") == "progress":
+            with _STATE_LOCK:
+                _STATE["progress"] = event
+
+    try:
+        # ── 0. Validate config + clear stale results ──────────────────────
+        err = _validate_config(cfg)
+        if err:
+            emit({"type": "error", "message": err})
+            with _STATE_LOCK:
+                _STATE["status"] = "error"
+                _STATE["error"] = err
+            return
+
+        # Clear stale results from any previous run.
+        with contextlib.suppress(Exception):
+            pipeline.clear_results(cfg)
+
+        # ── 1. Query vCPU quotas via truffle ─────────────────────────────
+        emit({"type": "phase", "label": "Querying vCPU quotas via truffle…"})
+
+        inst_types = nextflow_config.all_instance_types(cfg)  # arch-aware (cfg.BENCH_ARCH)
+        families = list({t.split(".")[0] for t in inst_types})
+        quotas = truffle.query_quotas(cfg.REGION, families)
+        queue_size = truffle.derive_queue_size(quotas, inst_types, cfg.REGION)
+
+        with _STATE_LOCK:
+            _STATE["queue_size"] = queue_size
+
+        if not quotas:
+            emit(
+                {
+                    "type": "phase",
+                    "label": (
+                        f"truffle not available — using default queueSize={queue_size} "
+                        "(install: brew install spore-host/tap/truffle)"
+                    ),
+                }
+            )
+        emit(
+            {
+                "type": "quota",
+                "queue_size": queue_size,
+                "summary": truffle.quota_summary(quotas, queue_size),
+            }
+        )
+
+        # ── 2. Ensure S3 bucket exists ────────────────────────────────────
+        emit({"type": "phase", "label": f"Ensuring S3 bucket s3://{cfg.BUCKET}…"})
+        _ensure_bucket(cfg)
+
+        # ── 3. Upload sample list and nextflow.config to S3 ──────────────
+        emit({"type": "phase", "label": "Uploading sample list and Nextflow config…"})
+
+        # Balanced N-per-super-population draw (AFR/EUR/EAS) so population-
+        # differentiation QC isn't confounded by uneven group sizes. Falls back
+        # to a flat slice of the panel when SAMPLES_PER_GROUP isn't set.
+        per_group = getattr(cfg, "SAMPLES_PER_GROUP", 0)
+        if per_group:
+            samples = select_balanced(per_group)
+        else:
+            sample_count = min(
+                getattr(cfg, "SAMPLE_COUNT", len(GENOMES_1000_SAMPLES)), len(GENOMES_1000_SAMPLES)
+            )
+            samples = GENOMES_1000_SAMPLES[:sample_count]
+        sample_count = len(samples)
+
+        srr_key = worker_script.write_srr_slice(cfg, samples)
+        pipeline.write_samples_csv(cfg, samples)
+        nf_cfg_str = nextflow_config.render(cfg, queue_size)
+        nf_cfg_key = worker_script.upload_nextflow_config(cfg, nf_cfg_str)
+        main_nf_key = worker_script.upload_main_nf(cfg)
+
+        emit(
+            {
+                "type": "phase",
+                "label": f"Config ready — queueSize={queue_size}, {sample_count} samples",
+            }
+        )  # noqa: E501
+
+        # ── 4. Launch Nextflow head instance ──────────────────────────────
+        emit({"type": "phase", "label": "Launching Nextflow head instance (t4g.small)…"})
+
+        # Zero-copy reference delivery (nf-spawn#55 symlink): write the single
+        # s3:// reference marker so main.nf's path-exists check passes without
+        # the head foreign-copying a local mount; each CALL_VARIANTS task
+        # symlinks the staged input to its FSx/EBS reference mount. Cleaned up
+        # in the finally below.
+        pipeline.write_reference_marker(cfg)
+
+        head_script = worker_script.render(cfg, nf_cfg_key, srr_key, main_nf_key)
+        head_script_path = worker_script.write_temp(head_script)
+
+        head_cfg = _head_cfg(cfg)
+        wg = spawn.launch_workers(head_cfg, head_script_path, emit=emit)
+        head_id = wg.instance_ids[0] if wg.instance_ids else None
+        start_time = time.time()
+
+        with _STATE_LOCK:
+            _STATE["head_instance_id"] = head_id
+
+        emit({"type": "head_launched", "instance_id": head_id})
+
+        # ── 5. Poll progress until head completes ─────────────────────────
+        _poll_until_done(cfg, head_id, start_time, queue_size, emit)
+
+        # ── 6. Bedrock synthesis ──────────────────────────────────────────
+        summary = pipeline.read_summary(cfg)
+        if summary:
+            with _STATE_LOCK:
+                _STATE["summary"] = summary
+            agent.synthesize(summary, emit)
+        else:
+            emit({"type": "error", "message": "Pipeline done but no summary.json found."})
+
+        with _STATE_LOCK:
+            _STATE["status"] = "complete"
+
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        with _STATE_LOCK:
+            _STATE["status"] = "error"
+            _STATE["error"] = msg
+        emit({"type": "error", "message": msg})
+    finally:
+        # Always remove this job's s3:// reference marker.
+        with contextlib.suppress(Exception):
+            pipeline.clear_reference_marker(cfg)
+
+
+# ---------------------------------------------------------------------------
+# Fake pipeline runner — no AWS calls, scripted events for rehearsal
+# ---------------------------------------------------------------------------
+
+# NOTE: these are illustrative numbers for UI rehearsal ONLY — the demo has
+# never been run, so no real measurements exist. They are deliberately round
+# placeholders, NOT a claim of measured results.
+_FAKE_SUMMARY = {
+    "total_samples": 30,
+    "completed": 30,
+    "failed": 0,
+    "elapsed_seconds": 1140.0,
+    "super_populations": {"AFR": 10, "EUR": 10, "EAS": 10},
+    # Cohort VCF stats (bcftools stats, chr20) — illustrative placeholders.
+    "vcf_stats": {
+        "total_records": 0,
+        "snps": 0,
+        "indels": 0,
+        "ti_tv_ratio": 0.0,
+    },
+    "data_volumes": {
+        "bam_bytes_read": 30_000_000_000,  # ~30 GB low-coverage BAMs from s3://1000genomes
+        "vcf_bytes": 60_000_000,  # ~60 MB per-sample chr20 VCFs (BAM streams through)
+    },
+}
+
+
+def _run_fake_pipeline() -> None:
+    """Simulated pipeline — emits scripted events with realistic timing."""
+    from . import agent
+
+    def emit(event: dict) -> None:
+        _broadcast(event)
+        if event.get("type") == "progress":
+            with _STATE_LOCK:
+                _STATE["progress"] = event
+
+    def step(label: str, delay: float = 0.8) -> None:
+        emit({"type": "phase", "label": label})
+        time.sleep(delay)
+
+    try:
+        step("Querying vCPU quotas via truffle…")
+        queue_size = 12
+        with _STATE_LOCK:
+            _STATE["queue_size"] = queue_size
+        emit(
+            {
+                "type": "quota",
+                "queue_size": queue_size,
+                "summary": "Queue size: 12  (c7g: 192 vCPUs free, t4g: 384 vCPUs free)",
+            }
+        )
+
+        step(f"Ensuring S3 bucket s3://{getattr(cfg, 'BUCKET', 'demo-bucket')}…")
+        step("Uploading sample list and Nextflow config…")
+        step(f"Config ready — queueSize={queue_size}, 30 samples")
+        step("Launching Nextflow head instance (t4g.small)…", delay=1.5)
+
+        emit({"type": "head_launched", "instance_id": "i-0fake1234567890ab"})
+        step("Head node booting, pulling bcftools/samtools containers…", delay=2.0)
+        step("Nextflow started — dispatching CALL_VARIANTS tasks via nf-spawn…", delay=1.0)
+
+        # Simulate rolling progress over ~20 seconds. Numbers are illustrative
+        # placeholders for UI rehearsal — the demo has never been run.
+        start_time = time.time()
+        variant_counts: dict = {}
+        total = 30
+
+        for tick in range(20):
+            elapsed = time.time() - start_time
+            done = min(total, int(tick * 1.65))
+            running = min(queue_size, total - done)
+            ec2_cost = elapsed / 3600 * (0.0168 + queue_size * 0.6528 * 0.4)
+
+            # Reveal a per-super-population headline as samples complete. These
+            # are illustrative placeholders only — not measured variant calls.
+            if done > 3 and "AFR" not in variant_counts:
+                variant_counts["AFR"] = ["chr20 SNPs called", "indels called"]
+            if done > 12 and "EUR" not in variant_counts:
+                variant_counts["EUR"] = ["chr20 SNPs called", "indels called"]
+            if done > 21 and "EAS" not in variant_counts:
+                variant_counts["EAS"] = ["chr20 SNPs called", "indels called"]
+
+            bam_gb = done * 1.0  # ~1 GB low-coverage BAM streamed per sample
+            vcf_gb = bam_gb * 0.002  # tiny chr20 VCF (BAM streams through)
+
+            emit(
+                {
+                    "type": "progress",
+                    "tasks_done": done,  # one CALL_VARIANTS task per sample
+                    "tasks_total": total,
+                    "tasks_running": running,
+                    "tasks_failed": 0,
+                    "queue_size": queue_size,
+                    "concurrency_pct": running / queue_size,
+                    "completion_pct": done / total,
+                    "ec2_cost_usd": ec2_cost,
+                    "elapsed_seconds": elapsed,
+                    "bam_gb": bam_gb,
+                    "vcf_gb": vcf_gb,
+                    "compression_ratio": (bam_gb / vcf_gb) if vcf_gb > 0 else 0,
+                    "variant_counts": variant_counts,
+                }
+            )
+            time.sleep(1.0)
+
+        step("All tasks complete. Building summary…", delay=1.0)
+
+        with _STATE_LOCK:
+            _STATE["summary"] = _FAKE_SUMMARY
+
+        agent.synthesize(_FAKE_SUMMARY, emit, backend=agent.FakeBackend())
+
+        with _STATE_LOCK:
+            _STATE["status"] = "complete"
+
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        with _STATE_LOCK:
+            _STATE["status"] = "error"
+            _STATE["error"] = msg
+        emit({"type": "error", "message": msg})
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _ensure_bucket(config) -> None:
+    """Create the S3 bucket if it doesn't exist (idempotent)."""
+    import boto3
+    from botocore.exceptions import ClientError
+
+    s3 = boto3.client("s3", region_name=config.REGION)
+    try:
+        if config.REGION == "us-east-1":
+            s3.create_bucket(Bucket=config.BUCKET)
+        else:
+            s3.create_bucket(
+                Bucket=config.BUCKET,
+                CreateBucketConfiguration={"LocationConstraint": config.REGION},
+            )
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        if code not in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
+            raise
+
+
+def _head_cfg(base_cfg):
+    """Return a config-like namespace for the head instance."""
+    import types
+
+    hc = types.SimpleNamespace(
+        **{k: getattr(base_cfg, k) for k in dir(base_cfg) if not k.startswith("_")}
+    )
+    hc.INSTANCE_TYPE = getattr(base_cfg, "HEAD_INSTANCE_TYPE", "t4g.small")
+    hc.INSTANCE_COUNT = 1
+    return hc
+
+
+def _poll_until_done(
+    config,
+    head_id: str | None,
+    start_time: float,
+    queue_size: int,
+    emit,
+    poll_interval: int = 15,
+    max_wait_minutes: int = 90,
+) -> None:
+    from . import pipeline, spawn
+
+    max_polls = (max_wait_minutes * 60) // poll_interval
+
+    for poll_num in range(max_polls):
+        time.sleep(poll_interval)
+
+        # Check completion via S3 progress.json (workaround for spawn#26 where
+        # --check-complete returns 0 before SPAWN_COMPLETE exists).
+        pipeline_done = pipeline.is_pipeline_complete(config)
+
+        # Also check if the instance has failed or disappeared.
+        if head_id:
+            statuses = spawn.poll_workers([head_id])
+            head_status = statuses.get(head_id, "running")
+            if head_status == "failed":
+                emit({"type": "error", "message": "Head instance failed — check logs."})
+                return
+        else:
+            head_status = "running"
+
+        prog = pipeline.poll_progress(config, start_time, queue_size)
+
+        emit(
+            {
+                "type": "progress",
+                "tasks_done": prog.tasks_done,
+                "tasks_total": prog.tasks_total,
+                "tasks_running": prog.tasks_running,
+                "tasks_failed": prog.tasks_failed,
+                "queue_size": prog.queue_size,
+                "concurrency_pct": prog.concurrency_pct,
+                "completion_pct": prog.completion_pct,
+                "ec2_cost_usd": prog.ec2_cost_usd,
+                "elapsed_seconds": prog.elapsed_seconds,
+                "bam_gb": prog.data.bam_gb,
+                "vcf_gb": prog.data.vcf_gb,
+                "compression_ratio": prog.data.compression_ratio,
+                "reference_gb": prog.data.reference_bytes_read / 1e9,
+                "variant_counts": prog.variant_counts,
+            }
+        )
+
+        if pipeline_done:
+            emit({"type": "phase", "label": "Nextflow complete. Building summary…"})
+            return
+
+        if (poll_num + 1) % 4 == 0:
+            emit(
+                {
+                    "type": "phase",
+                    "label": (
+                        f"{prog.tasks_done}/{prog.tasks_total} tasks done · "
+                        f"{prog.tasks_running} running · "
+                        f"{prog.elapsed_seconds / 60:.1f} min elapsed"
+                    ),
+                }
+            )
+
+    emit({"type": "error", "message": f"Timed out after {max_wait_minutes} minutes."})
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    import uvicorn
+
+    host = getattr(cfg, "HOST", "127.0.0.1")
+    port = getattr(cfg, "PORT", 8000)
+    url = f"http://{host}:{port}"
+
+    if _FAKE:
+        print("1000 Genomes Variant Calling Demo → FAKE MODE (no AWS calls)")
+
+    _launch_config["url"] = url
+    print(f"1000 Genomes Variant Calling Demo → {url}")
+    uvicorn.run(app, host=host, port=port, log_level="warning")
+
+
+if __name__ == "__main__":
+    main()

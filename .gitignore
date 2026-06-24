@@ -1,0 +1,16 @@
+config.py
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+samples/
+*.log
+
+# Raw per-sample VCFs are large and regenerable — keep them out of git. Commit only
+# the summaries (MEASUREMENTS.md, *-fsx.json, qc_*.json, staging_timings*.json).
+# Re-pull raw VCFs from the run's S3 results prefix when needed for analyze_study.py.
+benchmark/results/**/variants/
+*.vcf
+*.vcf.gz
+*.vcf.gz.tbi
