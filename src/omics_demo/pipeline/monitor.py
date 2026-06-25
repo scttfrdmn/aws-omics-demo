@@ -41,9 +41,9 @@ def read_trace():
     if len(lines) < 2:
         return []
     header = lines[0].split("\t")
-    # strict=False: trace rows may have fewer fields than the header (trailing
-    # optional columns) — zip to the shorter, don't raise.
-    return [dict(zip(header, line.split("\t"), strict=False)) for line in lines[1:] if line.strip()]
+    # zip to the shorter (trace rows may have fewer fields than the header). NB:
+    # no strict= kwarg — the head-node AMI runs Python 3.9, where zip() predates it.
+    return [dict(zip(header, line.split("\t"))) for line in lines[1:] if line.strip()]  # noqa: B905
 
 
 def parse_rchar(s):

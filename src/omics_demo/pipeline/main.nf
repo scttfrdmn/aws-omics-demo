@@ -26,8 +26,14 @@ params.samples        = params.samples        ?: 'samples.csv'
 // (NOT 'chr20' — the 'chr'-prefix is the hg19/GRCh38 convention).
 params.regions        = params.regions        ?: '20'
 // FSx mount point on each task instance (nf-spawn mounts the shared filesystem
-// here via `ext.fsx`). The reference FASTA + its .fai live at <fsx_mount>/reference.
+// here via `ext.fsx`). This is WHERE the filesystem mounts.
 params.fsx_mount      = params.fsx_mount       ?: '/fsx'
+// Absolute path to the reference FASTA on the mounted filesystem (its .fai sits
+// alongside as <reference_path>.fai). Kept SEPARATE from fsx_mount: the file's
+// location within the FS depends on how the S3→FSx import (DRA) is scoped, which
+// is independent of where the FS itself mounts. Default assumes the reference is
+// at the mount root (DRA scoped to the reference prefix).
+params.reference_path = params.reference_path  ?: "${params.fsx_mount}/reference"
 // bcftools container image. CALL_VARIANTS invokes it via an explicit `docker run`
 // (see that process); nextflow.config injects the arch-correct image (aarchbio on
 // Graviton, biocontainers on x86). This fallback keeps main.nf runnable alone.
@@ -92,9 +98,22 @@ process CALL_VARIANTS {
     # real .fai DIRECTLY off FSx — genuinely zero-copy, no per-task reference copy.
     BCFTOOLS_IMG='${params.bcftools_image}'
     FSX='${params.fsx_mount}'
+    REF='${params.reference_path}'
+    # Wait for the FSx Lustre mount + reference to be ready. nf-spawn mounts the
+    # filesystem shortly after the instance boots (lustre-client install + mount,
+    # ~30-60s), and a fast task can reach this point before the reference is
+    # visible — bcftools would then fail "Failed to open FASTA file ...". Poll up
+    # to 5 min for the reference FASTA + its .fai to be readable as FILES (not a
+    # stale directory — guard with -f so a leftover dir at the path is rejected).
+    for _ in \$(seq 1 60); do
+        [ -f "\${REF}" ] && [ -f "\${REF}.fai" ] && break
+        echo "waiting for reference file at \${REF} ..."
+        sleep 5
+    done
+    [ -f "\${REF}" ] || { echo "ERROR: reference file \${REF} not available after 5 min"; exit 1; }
     T2=\$(date +%s.%N)
     docker run --rm -v "\${PWD}:/work" -v "\${FSX}:\${FSX}:ro" -w /work "\${BCFTOOLS_IMG}" \\
-        sh -c "bcftools mpileup -f \${FSX}/reference -r ${params.regions} ./${sample_id}.bam \\
+        sh -c "bcftools mpileup -f \${REF} -r ${params.regions} ./${sample_id}.bam \\
                | bcftools call -mv -Oz -o ${sample_id}.vcf.gz && \\
                bcftools index -t ${sample_id}.vcf.gz"
     T3=\$(date +%s.%N)

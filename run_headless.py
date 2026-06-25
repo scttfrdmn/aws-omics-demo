@@ -171,6 +171,10 @@ def main() -> None:
     )
     head_cfg.INSTANCE_TYPE = getattr(cfg, "HEAD_INSTANCE_TYPE", "t4g.small")
     head_cfg.INSTANCE_COUNT = 1
+    # The head AMI must match the head INSTANCE_TYPE's architecture. cfg.AMI_ID is
+    # just a display default (arm64); use the arch-correct tools AMI so an x86 head
+    # (c7i.large) gets the x86 AMI, not the arm64 one (→ spawn launch exit 1).
+    head_cfg.AMI_ID = nextflow_config.tools_ami(cfg)
 
     # Reference delivery is zero-copy via the single s3:// reference marker +
     # nf-spawn ext.fsx/ext.volumes symlink (nf-spawn#55): main.nf points

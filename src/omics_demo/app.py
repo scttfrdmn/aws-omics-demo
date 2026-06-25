@@ -534,6 +534,11 @@ def _head_cfg(base_cfg):
     )
     hc.INSTANCE_TYPE = getattr(base_cfg, "HEAD_INSTANCE_TYPE", "t4g.small")
     hc.INSTANCE_COUNT = 1
+    # Head AMI must match the head INSTANCE_TYPE's arch (cfg.AMI_ID is the arm64
+    # display default); use the arch-correct tools AMI.
+    from . import nextflow_config
+
+    hc.AMI_ID = nextflow_config.tools_ami(base_cfg)
     return hc
 
 
