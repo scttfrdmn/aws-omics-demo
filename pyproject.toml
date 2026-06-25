@@ -34,6 +34,12 @@ line-length = 100
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
+[tool.ruff.lint.isort]
+# Pin first-party modules so import ordering is deterministic across ruff
+# versions (CI installs ruff>=0.9; isort's auto-detection of local modules like
+# `config`/`build_ami` otherwise drifts and fails the check on newer ruff).
+known-first-party = ["omics_demo", "config", "build_ami"]
+
 [tool.ruff.lint.per-file-ignores]
 # nextflow_config.py builds the nextflow.config as a long-lined template string.
 "src/omics_demo/nextflow_config.py" = ["E501"]
