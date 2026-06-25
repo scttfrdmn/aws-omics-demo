@@ -1,0 +1,1 @@
+{"sample_id":"HG00096","population":"GBR","super_population":"EUR","instance_type":"c7g.2xlarge","instance_id":"i-08cfd416a52d82786","az":"us-east-1a","lifecycle":"on-demand","vcpus":8,"arch":"aarch64","bam_download_s":3.660,"bam_bytes":318238352,"bam_mbps":82.92,"bcftools_call_s":112.641,"vcf_gz_bytes":2052615}

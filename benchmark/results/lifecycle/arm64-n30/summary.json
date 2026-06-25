@@ -1,0 +1,1 @@
+{"total_samples": 32, "completed": 32, "failed": 0, "elapsed_seconds": 498.86728262901306, "super_populations": {"AFR": 10, "EUR": 10, "EAS": 10}, "vcf_stats": {}, "data_volumes": {"bam_bytes_read": 0, "vcf_bytes": 0}}
