@@ -157,6 +157,7 @@ def main() -> None:
     nf_cfg_str = nextflow_config.render(cfg, queue_size)
     nf_cfg_key = worker_script.upload_nextflow_config(cfg, nf_cfg_str)
     main_nf_key = worker_script.upload_main_nf(cfg)
+    worker_script.upload_monitor(cfg)
     emit(
         {"type": "phase", "label": f"Config ready — queueSize={queue_size}, {sample_count} samples"}
     )  # noqa: E501

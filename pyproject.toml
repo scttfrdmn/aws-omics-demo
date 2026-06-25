@@ -2,6 +2,12 @@
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build.targets.wheel]
+packages = ["src/omics_demo"]
+# Ship the non-Python pipeline artifacts (main.nf, monitor.py, the bootstrap
+# template, README) — worker_script.py reads them from pipeline/ at runtime.
+artifacts = ["src/omics_demo/pipeline/*"]
+
 [project]
 name = "omics-demo"
 version = "0.1.0"
@@ -29,9 +35,7 @@ line-length = 100
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.ruff.lint.per-file-ignores]
-# worker_script.py contains Python embedded inside bash heredoc strings;
-# ruff cannot parse those sections and reports false invalid-syntax errors.
-"src/omics_demo/worker_script.py" = ["E501", "E999"]
+# nextflow_config.py builds the nextflow.config as a long-lined template string.
 "src/omics_demo/nextflow_config.py" = ["E501"]
 "build_ami.py" = ["E501"]
 # build_fsx_db.py embeds the staging user-data as a bash heredoc; those lines

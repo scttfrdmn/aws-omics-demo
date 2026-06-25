@@ -79,13 +79,14 @@ def test_render_uses_main_nf(mock_cfg):
 
 
 def test_main_nf_contains_variant_calling_stages():
-    """The embedded main.nf must include the variant-calling DAG processes."""
-    from omics_demo.worker_script import _MAIN_NF
+    """pipeline/main.nf must include the variant-calling DAG processes."""
+    from omics_demo.worker_script import _read
 
-    assert "CALL_VARIANTS" in _MAIN_NF
-    assert "MERGE_VCFS" in _MAIN_NF
-    assert "VCF_STATS" in _MAIN_NF
+    main_nf = _read("main.nf")
+    assert "CALL_VARIANTS" in main_nf
+    assert "MERGE_VCFS" in main_nf
+    assert "VCF_STATS" in main_nf
     # CALL_VARIANTS reads BAMs from the 1000 Genomes Open Data bucket and calls
     # variants with bcftools.
-    assert "1000genomes" in _MAIN_NF
-    assert "bcftools" in _MAIN_NF
+    assert "1000genomes" in main_nf
+    assert "bcftools" in main_nf
