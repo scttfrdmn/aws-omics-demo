@@ -30,16 +30,31 @@
 
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
+    /* Dark scrollbars (default light gutters clash with the dark theme). */
+    * { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+    ::-webkit-scrollbar { width: 10px; height: 10px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb {
+      background: var(--border);
+      border-radius: 6px;
+      border: 2px solid var(--bg);
+    }
+    ::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+
     body {
       background: var(--bg);
       color: var(--text);
       font-family: var(--font);
-      font-size: 15px;
+      font-size: 17px;          /* bumped from 15px for talk legibility */
       line-height: 1.6;
-      min-height: 100vh;
+      height: 100vh;
       display: flex;
       flex-direction: column;
+      overflow: hidden;         /* page itself never scrolls; columns scroll internally */
     }
+
+    /* Fixed top region: title header + hero stay locked while the feed scrolls. */
+    .topbar { flex: none; }
 
     /* ── Header ─────────────────────────────────────────────────── */
     header {
@@ -50,8 +65,8 @@
       gap: 16px;
       background: var(--surface);
     }
-    header h1 { font-size: 1.1rem; font-weight: 700; letter-spacing: 0.01em; }
-    header .sub { font-size: 0.82rem; color: var(--muted); }
+    header h1 { font-size: 1.4rem; font-weight: 700; letter-spacing: 0.01em; }
+    header .sub { font-size: 0.95rem; color: var(--muted); }
 
     /* Hero headline — the talk's payoff line. Big, centered, tabular numerals. */
     .hero {
@@ -62,16 +77,16 @@
     }
     .hero-num {
       display: block;
-      font-size: 2.6rem;
+      font-size: 3.4rem;
       font-weight: 800;
       color: var(--green);
       font-variant-numeric: tabular-nums;
       letter-spacing: 0.01em;
       line-height: 1.1;
     }
-    .hero-cap { font-size: 0.9rem; color: var(--muted); }
+    .hero-cap { font-size: 1.05rem; color: var(--muted); }
     .hero-final .hero-num {
-      font-size: 3.4rem;
+      font-size: 4.6rem;
       text-shadow: 0 0 24px rgba(63, 185, 80, 0.35);
       animation: heroPop 0.6s ease;
     }
@@ -96,12 +111,12 @@
 
     /* ── Layout ─────────────────────────────────────────────────── */
     main {
-      flex: 1;
+      flex: 1;                 /* fills whatever the fixed topbar leaves — no brittle calc */
+      min-height: 0;           /* allow inner columns to scroll within the flex child */
       display: grid;
-      grid-template-columns: 1fr 340px;
+      grid-template-columns: 1fr 380px;
       gap: 0;
       overflow: hidden;
-      height: calc(100vh - 60px);
     }
 
     /* ── Left column — live feed ─────────────────────────────────── */
@@ -119,7 +134,7 @@
       justify-content: space-between;
       background: var(--surface);
     }
-    .feed-header h2 { font-size: 0.85rem; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+    .feed-header h2 { font-size: 1rem; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
     .feed-scroll {
       flex: 1;
       overflow-y: auto;
@@ -137,10 +152,10 @@
     }
     @keyframes fadein { to { opacity: 1; } }
 
-    .event-time { color: var(--muted); font-size: 0.78rem; white-space: nowrap; padding-top: 2px; min-width: 48px; }
+    .event-time { color: var(--muted); font-size: 0.88rem; white-space: nowrap; padding-top: 2px; min-width: 54px; }
     .event-body { flex: 1; }
-    .event-type { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
-    .event-text { font-size: 0.9rem; color: var(--text); }
+    .event-type { font-size: 0.8rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+    .event-text { font-size: 1.02rem; color: var(--text); }
 
     /* ── Start button / status ───────────────────────────────────── */
     .start-area {
@@ -231,7 +246,7 @@
       padding: 16px 18px;
     }
     .panel-section h3 {
-      font-size: 0.78rem;
+      font-size: 0.9rem;
       font-weight: 700;
       text-transform: uppercase;
       letter-spacing: 0.05em;
@@ -241,14 +256,14 @@
 
     /* Cost meter */
     .cost-big {
-      font-size: 2rem;
+      font-size: 2.6rem;
       font-weight: 700;
       color: var(--green);
       font-variant-numeric: tabular-nums;
       letter-spacing: -0.01em;
     }
     .cost-sub {
-      font-size: 0.78rem;
+      font-size: 0.9rem;
       color: var(--muted);
       margin-top: 2px;
     }
@@ -289,6 +304,8 @@
 
 <body x-data="demo()" x-init="init()">
 
+<!-- ── Fixed top region: header + hero stay locked while the feed scrolls ── -->
+<div class="topbar">
 <!-- ── Header ─────────────────────────────────────────────────────── -->
 <header>
   <div>
@@ -316,6 +333,7 @@
   <span class="hero-cap" x-show="status === 'complete'">sequenced &amp; variant-called on AWS</span>
   <span class="hero-cap" x-show="status === 'running'">and counting…</span>
 </div>
+</div><!-- /.topbar -->
 
 <!-- ── Main ───────────────────────────────────────────────────────── -->
 <main>
