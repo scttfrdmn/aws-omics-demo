@@ -221,13 +221,15 @@ def bake_ami(cfg) -> str:
             raise
         print(f"  Bucket exists: s3://{cfg.BUCKET}")
 
-    # arm64 bake instance so the AMI (and its baked spawn CLI) target Graviton.
-    # The reference genome is NOT downloaded here (it rides FSx now), so the bake
-    # is light — a small instance is plenty for dnf installs + plugin caching.
-    # spawn auto-detects the latest AL2023 arm64 AMI for an arm64 type.
-    # (For the x86 leg, point BENCH_ARCH at x86 and bake on a c7i.xlarge —
-    # spawn picks the amd64 AL2023 base and the amd64 spawn rpm/binary.)
-    bake_instance_type = "c7g.xlarge"
+    # Bake instance arch follows cfg.BENCH_ARCH so the AMI (and its baked spawn
+    # CLI binary) target the right family. The reference genome is NOT downloaded
+    # here (it rides FSx now), so the bake is light — a small instance is plenty
+    # for dnf installs + plugin caching. spawn auto-detects the latest AL2023 base
+    # for the instance arch (arm64 type → aarch64 base + arm64 spawn rpm; x86 type
+    # → amd64 base + amd64 rpm). Neither arch emulates the other.
+    arch = getattr(cfg, "BENCH_ARCH", "arm64")
+    bake_instance_type = "c7i.xlarge" if arch == "x86" else "c7g.xlarge"
+    bake_name = f"omics-bake-{arch}"
 
     print("Launching bake instance via spawn...")
     print(f"  Instance type: {bake_instance_type}")
@@ -251,7 +253,7 @@ def bake_ami(cfg) -> str:
         [
             "spawn",
             "launch",
-            "omics-bake",
+            bake_name,
             "--instance-type",
             bake_instance_type,
             "--region",
@@ -283,7 +285,7 @@ def bake_ami(cfg) -> str:
             if not isinstance(instances, list):
                 instances = [instances]
             for inst in instances:
-                if inst.get("name") == "omics-bake":
+                if inst.get("name") == bake_name:
                     instance_id = inst.get("instance_id") or inst.get("InstanceId")
                     break
         except (json.JSONDecodeError, KeyError):
@@ -305,7 +307,7 @@ def bake_ami(cfg) -> str:
     for attempt in range(180):
         time.sleep(60)
         status_result = subprocess.run(
-            ["spawn", "status", "omics-bake", "--check-complete"],
+            ["spawn", "status", bake_name, "--check-complete"],
             capture_output=True,
             check=False,
         )
@@ -321,18 +323,18 @@ def bake_ami(cfg) -> str:
         print("  Bake timed out after 180 minutes")
         sys.exit(1)
 
-    ami_name = "nf-spawn-arm64-tools-v0.8.0"
+    ami_name = f"nf-spawn-{arch}-tools-v0.8.0-omics"
     print(f"\n  Creating AMI '{ami_name}' via spawn ami create...")
     result = subprocess.run(
         [
             "spawn",
             "ami",
             "create",
-            "omics-bake",
+            bake_name,
             "--name",
             ami_name,
             "--description",
-            "Omics demo (1000 Genomes variant calling) ARM64/Graviton tools AMI: Nextflow + nf-spawn 0.8.0 + Docker (reference genome on FSx, not baked)",
+            f"Omics demo (1000 Genomes variant calling) {arch} tools AMI: Nextflow + nf-spawn 0.8.0 + Docker (reference genome on FSx, not baked)",
             "--wait",
             "-o",
             "json",
@@ -356,7 +358,7 @@ def bake_ami(cfg) -> str:
         sys.exit(1)
 
     print(f"  AMI ready: {ami_id}")
-    subprocess.run(["spawn", "terminate", "omics-bake", "-y"], check=False)
+    subprocess.run(["spawn", "terminate", bake_name, "-y"], check=False)
     return ami_id
 
 
@@ -366,19 +368,21 @@ if __name__ == "__main__":
 
     import config as cfg  # type: ignore[import]
 
-    # The bake produces a lean native ARM64/Graviton TOOLS AMI (Nextflow + Docker
-    # + nf-spawn + spawn CLI). The reference genome is NOT baked — it rides FSx —
-    # and bcftools/samtools run in containers, so the whole variant-calling
-    # pipeline runs native arm64 (no emulation).
-    # If AMI_ID_ARM64 is already set, just report it.
-    if getattr(cfg, "AMI_ID_ARM64", ""):
-        print(f"ARM64 AMI already configured: {cfg.AMI_ID_ARM64}")
-        print("To rebuild: set AMI_ID_ARM64 = '' in config.py and re-run.")
+    # The bake produces a lean native TOOLS AMI (Nextflow + Docker + nf-spawn +
+    # spawn CLI) for the arch in cfg.BENCH_ARCH. The reference genome is NOT baked
+    # — it rides FSx — and bcftools/samtools run in containers, so the whole
+    # variant-calling pipeline runs native (no emulation). Bake each arch by
+    # setting BENCH_ARCH ('arm64' or 'x86') in config.py and re-running.
+    arch = getattr(cfg, "BENCH_ARCH", "arm64")
+    ami_var = "AMI_ID_X86" if arch == "x86" else "AMI_ID_ARM64"
+    if getattr(cfg, ami_var, ""):
+        print(f"{arch} AMI already configured: {getattr(cfg, ami_var)}")
+        print(f"To rebuild: set {ami_var} = '' in config.py and re-run.")
         sys.exit(0)
 
-    print("=== 1000 Genomes Variant Calling Demo — ARM64 AMI Build ===\n")
+    print(f"=== 1000 Genomes Variant Calling Demo — {arch} AMI Build ===\n")
     ami_id = bake_ami(cfg)
 
     print("\nDone.  Paste into config.py:")
-    print(f'  AMI_ID_ARM64 = "{ami_id}"')
+    print(f'  {ami_var} = "{ami_id}"')
     print("\nNext step: make demo")

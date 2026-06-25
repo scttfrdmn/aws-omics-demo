@@ -1,0 +1,231 @@
+#!/bin/bash
+# head_bootstrap.sh — cloud-init for the Nextflow head instance.
+#
+# Launched once per run by app.py / run_headless.py via spawn. This node does NOT
+# do any bioinformatics — it only orchestrates: install/verify Nextflow + the
+# nf-spawn executor, fetch the pipeline artifacts from S3, run `nextflow run`, and
+# report progress. Every actual pipeline task runs on its own ephemeral EC2
+# instance that nf-spawn launches and reaps. @@TOKEN@@ placeholders are
+# substituted by omics_demo.worker_script.render().
+set -euxo pipefail
+exec > /var/log/nextflow-head.log 2>&1
+
+echo "=== 1000 Genomes Variant Calling Demo — Head Node ==="
+echo "Started: $(date)"
+echo "Instance: $(curl -sf http://169.254.169.254/latest/meta-data/instance-id || echo unknown)"
+
+BUCKET="@@BUCKET@@"
+REGION="@@REGION@@"
+JOB_NAME="@@JOB_NAME@@"
+NF_CONFIG_KEY="@@NF_CONFIG_KEY@@"
+SAMPLE_LIST_KEY="@@SRR_LIST_KEY@@"
+MAIN_NF_KEY="@@MAIN_NF_KEY@@"
+MONITOR_KEY="@@MONITOR_KEY@@"
+RESULTS_PREFIX="s3://${BUCKET}/results/${JOB_NAME}"
+
+# ── Environment the spawn CLI + Nextflow need ────────────────────────────────
+export PATH="/usr/local/bin:/usr/bin:/bin:${PATH}"
+export AWS_DEFAULT_REGION="@@REGION@@"   # spawn CLI uses this for STS discovery
+export AWS_REGION="@@REGION@@"
+export AWS_STS_REGIONAL_ENDPOINTS=regional
+export HOME=/root                        # spawn CLI locates its config under $HOME
+# spawn needs an SSH key to reach the instances it launches (spawn#37: should be
+# auto-generated; this is the workaround until that ships).
+if [ ! -f /root/.ssh/id_rsa ]; then
+    mkdir -p /root/.ssh
+    ssh-keygen -t rsa -b 4096 -f /root/.ssh/id_rsa -N '' 2>&1
+fi
+
+# ── Verify / self-heal the baked tool cache ──────────────────────────────────
+# The tools AMI pre-bakes Nextflow + the nf-spawn & nf-amazon plugins. But an AMI
+# snapshot can capture the filesystem before files finish flushing, leaving
+# zero-byte jars/manifests (observed in practice → Nextflow fails with
+# "Field 'id' cannot be empty"). So VALIDATE each artifact and re-fetch if empty,
+# rather than trusting a directory check. This makes the head robust to a bad bake.
+TARGET_NF_SPAWN_VERSION="0.8.0"
+NF_PLUGIN_DIR="/opt/nextflow_cache/plugins"
+NF_SPAWN_PLUGIN_DIR="${NF_PLUGIN_DIR}/nf-spawn-${TARGET_NF_SPAWN_VERSION}"
+NF_SPAWN_MANIFEST="${NF_SPAWN_PLUGIN_DIR}/classes/META-INF/MANIFEST.MF"
+if [ ! -s "${NF_SPAWN_MANIFEST}" ] || ! grep -q '^Plugin-Id:' "${NF_SPAWN_MANIFEST}" 2>/dev/null; then
+    echo "Installing nf-spawn v${TARGET_NF_SPAWN_VERSION} (no valid cached plugin)..."
+    ZIP_URL="https://github.com/spore-host/nf-spawn/releases/download/v${TARGET_NF_SPAWN_VERSION}/nf-spawn-${TARGET_NF_SPAWN_VERSION}.zip"
+    rm -rf "${NF_SPAWN_PLUGIN_DIR}"
+    mkdir -p "${NF_SPAWN_PLUGIN_DIR}"
+    curl -fsSL "${ZIP_URL}" -o /tmp/nf-spawn.zip
+    unzip -q /tmp/nf-spawn.zip -d "${NF_SPAWN_PLUGIN_DIR}"
+    rm /tmp/nf-spawn.zip
+    echo "nf-spawn ${TARGET_NF_SPAWN_VERSION} installed."
+fi
+# Nextflow framework jar (seen zero-byte on a bad bake) — force a clean re-fetch.
+NXF_JAR=$(find /opt/nextflow_cache/framework -name 'nextflow-*-one.jar' 2>/dev/null | head -1)
+if [ -z "${NXF_JAR}" ] || [ ! -s "${NXF_JAR}" ]; then
+    echo "Nextflow framework jar missing/empty — forcing clean fetch..."
+    rm -rf /opt/nextflow_cache/framework
+    NXF_HOME=/opt/nextflow_cache /usr/local/bin/nextflow -version >/dev/null 2>&1 || true
+fi
+# nf-amazon plugin (provides the s3:// FileSystem for the work dir).
+NF_AMAZON_MANIFEST=$(find /opt/nextflow_cache/plugins/nf-amazon-* -name MANIFEST.MF 2>/dev/null | head -1)
+if [ -z "${NF_AMAZON_MANIFEST}" ] || [ ! -s "${NF_AMAZON_MANIFEST}" ]; then
+    echo "nf-amazon plugin missing/empty — reinstalling..."
+    rm -rf /opt/nextflow_cache/plugins/nf-amazon-*
+    NXF_HOME=/opt/nextflow_cache /usr/local/bin/nextflow plugin install nf-amazon@2.8.0 >/dev/null 2>&1 || true
+fi
+
+# ── Upgrade the spawn CLI to the latest release ──────────────────────────────
+# Always run the latest spawn so upstream fixes land without a full AMI rebake.
+CURRENT_SPAWN_VERSION=$(spawn version 2>/dev/null | awk '/^Version:/{print $2}' || echo "unknown")
+LATEST_SPAWN_VERSION=$(curl -fsSL "https://api.github.com/repos/spore-host/spawn/releases/latest" \
+    2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'].lstrip('v'))" \
+    2>/dev/null || echo "")
+if [ -n "${LATEST_SPAWN_VERSION}" ] && [ "${CURRENT_SPAWN_VERSION}" != "${LATEST_SPAWN_VERSION}" ]; then
+    echo "Upgrading spawn: ${CURRENT_SPAWN_VERSION} → ${LATEST_SPAWN_VERSION}"
+    ARCH=$(uname -m)
+    case "${ARCH}" in
+        aarch64) SPAWN_ARCH="arm64" ;;
+        x86_64)  SPAWN_ARCH="amd64" ;;
+        *)        echo "Unknown arch ${ARCH}, skipping spawn upgrade"; SPAWN_ARCH="" ;;
+    esac
+    if [ -n "${SPAWN_ARCH}" ]; then
+        SPAWN_URL="https://github.com/spore-host/spawn/releases/download/v${LATEST_SPAWN_VERSION}/spawn_${LATEST_SPAWN_VERSION}_linux_${SPAWN_ARCH}.tar.gz"
+        TMP_DIR=$(mktemp -d)
+        curl -fsSL "${SPAWN_URL}" -o "${TMP_DIR}/spawn.tar.gz" \
+            && tar -xzf "${TMP_DIR}/spawn.tar.gz" -C "${TMP_DIR}" \
+            && chmod +x "${TMP_DIR}/spawn" \
+            && mv "${TMP_DIR}/spawn" /usr/local/bin/spawn \
+            && echo "spawn upgraded to $(spawn version 2>/dev/null | awk '/^Version:/{print $2}')" \
+            || echo "spawn upgrade failed — continuing with ${CURRENT_SPAWN_VERSION}"
+        rm -rf "${TMP_DIR}"
+    fi
+else
+    echo "spawn ${CURRENT_SPAWN_VERSION} is current"
+fi
+
+# ── Prerequisites ────────────────────────────────────────────────────────────
+command -v nextflow || { echo "ERROR: nextflow not found at /usr/local/bin/nextflow"; exit 1; }
+command -v spawn    || { echo "ERROR: spawn not found on PATH"; exit 1; }
+# No reference-genome check: the human_g1k_v37 reference is NOT on this node — it
+# rides a shared FSx filesystem, mounted read-only on each CALL_VARIANTS task via
+# nf-spawn ext.fsx. The head only orchestrates.
+
+# ── Fetch the pipeline artifacts from S3 ─────────────────────────────────────
+mkdir -p /tmp/nf-head
+aws s3 cp "s3://${BUCKET}/${NF_CONFIG_KEY}"  /tmp/nf-head/nextflow.config  --region "${REGION}"
+aws s3 cp "s3://${BUCKET}/${SAMPLE_LIST_KEY}" /tmp/nf-head/sample_list.json --region "${REGION}"
+aws s3 cp "s3://${BUCKET}/${MAIN_NF_KEY}"    /tmp/nf-head/main.nf          --region "${REGION}"
+aws s3 cp "s3://${BUCKET}/${MONITOR_KEY}"    /tmp/nf-head/monitor.py       --region "${REGION}"
+
+# ── Build the samples CSV from the sample list ───────────────────────────────
+# Columns: sample_id,population,super_population,bam_path. Each CALL_VARIANTS task
+# reads its BAM directly from s3://1000genomes at task runtime (BAMs pre-aligned).
+python3 - << 'PYEOF'
+import csv, json
+with open("/tmp/nf-head/sample_list.json") as f:
+    samples = json.load(f)
+rows = [{"sample_id": s["sample_id"], "population": s.get("population", "unknown"),
+         "super_population": s.get("super_population", "unknown"), "bam_path": s["bam_path"]}
+        for s in samples]
+with open("/tmp/nf-head/samples.csv", "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=["sample_id", "population", "super_population", "bam_path"])
+    w.writeheader(); w.writerows(rows)
+print(f"Samples CSV: {len(rows)} samples")
+PYEOF
+
+# ── Initial progress.json ────────────────────────────────────────────────────
+python3 - << 'PYEOF'
+import json, boto3, time
+boto3.client("s3", region_name="@@REGION@@").put_object(
+    Bucket="@@BUCKET@@", Key="results/@@JOB_NAME@@/progress.json",
+    Body=json.dumps({"status": "running", "started_at": time.time(), "tasks_total": 0,
+                     "tasks_running": 0, "tasks_done": 0, "tasks_failed": 0,
+                     "bam_bytes_read": 0, "vcf_bytes": 0}))
+PYEOF
+
+dnf install -y tmux 2>&1 | grep -E "^(Installing|Complete|Error)" || true
+
+# ── Run the pipeline (in tmux so it survives SSH disconnects) ────────────────
+# Reattach with: ssh ec2-user@<ip> -t "tmux attach -t nf"
+cat > /tmp/nf-head/run_pipeline.sh << 'PIPEEOF'
+#!/bin/bash
+set -euo pipefail
+cd /tmp/nf-head
+echo "=== Variant calling: CALL_VARIANTS → MERGE_VCFS → VCF_STATS ==="
+NXF_HOME=/opt/nextflow_cache \
+    /usr/local/bin/nextflow run /tmp/nf-head/main.nf \
+    --samples /tmp/nf-head/samples.csv \
+    --regions 20 \
+    --outdir "${RESULTS_PREFIX}/" \
+    -c /tmp/nf-head/nextflow.config \
+    -w "s3://${BUCKET}/work/${JOB_NAME}/call/"
+PIPEEOF
+sed -i "s|\${BUCKET}|${BUCKET}|g; s|\${JOB_NAME}|${JOB_NAME}|g; s|\${RESULTS_PREFIX}|${RESULTS_PREFIX}|g" \
+    /tmp/nf-head/run_pipeline.sh
+chmod +x /tmp/nf-head/run_pipeline.sh
+
+tmux new-session -d -s nf -x 220 -y 50 2>/dev/null || true
+tmux send-keys -t nf "/tmp/nf-head/run_pipeline.sh 2>&1 | tee /tmp/nf-head/nextflow.stdout; echo NF_EXIT:\$? > /tmp/nf-head/pipeline.exit" Enter
+sleep 5
+NF_PID=$(pgrep -f "run_pipeline.sh" | head -1 || echo "0")
+echo "Pipeline PID: ${NF_PID}"
+
+# ── Progress monitor (shipped from S3, runs alongside Nextflow) ──────────────
+python3 /tmp/nf-head/monitor.py "${NF_PID}" &
+MONITOR_PID=$!
+
+echo "Waiting for pipeline to complete..."
+while [ ! -f /tmp/nf-head/pipeline.exit ]; do
+    if [ "${NF_PID}" != "0" ] && ! kill -0 "${NF_PID}" 2>/dev/null; then
+        sleep 10; break
+    fi
+    sleep 15
+done
+NF_EXIT=$(grep -o '[0-9]*$' /tmp/nf-head/pipeline.exit 2>/dev/null || echo "0")
+echo "Pipeline exit code: ${NF_EXIT}"
+sleep 20
+kill ${MONITOR_PID} 2>/dev/null || true
+
+# ── Final summary.json ───────────────────────────────────────────────────────
+python3 - << 'PYEOF'
+import boto3, json
+s3 = boto3.client("s3", region_name="@@REGION@@")
+bucket = "@@BUCKET@@"; job_name = "@@JOB_NAME@@"; results_pf = f"results/{job_name}"
+try:
+    prog = json.loads(s3.get_object(Bucket=bucket, Key=f"{results_pf}/progress.json")["Body"].read())
+except Exception:
+    prog = {}
+try:
+    stats = json.loads(s3.get_object(Bucket=bucket, Key=f"{results_pf}/stats.json")["Body"].read())
+except Exception:
+    stats = prog.get("stats", {})
+super_pops: dict = {}
+try:
+    with open("/tmp/nf-head/sample_list.json") as f:
+        for item in json.load(f):
+            sp = item.get("super_population", "unknown")
+            super_pops[sp] = super_pops.get(sp, 0) + 1
+except Exception:
+    pass
+summary = {
+    "total_samples": prog.get("tasks_done", 0),
+    "completed": prog.get("tasks_done", 0),
+    "failed": prog.get("tasks_failed", 0),
+    "elapsed_seconds": prog.get("elapsed_seconds", 0),
+    "super_populations": super_pops,
+    "vcf_stats": stats,
+    "data_volumes": {"bam_bytes_read": prog.get("bam_bytes_read", 0),
+                     "vcf_bytes": prog.get("vcf_bytes", 0)},
+}
+s3.put_object(Bucket=bucket, Key=f"{results_pf}/summary.json", Body=json.dumps(summary))
+print(f"Summary written: {summary['total_samples']} samples")
+PYEOF
+
+# ── Harvest the per-task billed-time signal ──────────────────────────────────
+# On the spawn executor the trace realtime/duration columns are wrapper-local
+# (sub-second) and useless for per-stage timing. The AUTHORITATIVE per-task
+# wall-clock is nf-spawn's lifecycle log ("Submitting task ..." / "Task ...
+# completed ... on instance 'nf-X'", both timestamped). Upload .nextflow.log so
+# the benchmark analysis can parse submit→complete per task (≈ EC2 billed lifetime).
+aws s3 cp /tmp/nf-head/.nextflow.log "${RESULTS_PREFIX}/nextflow.head.log" \
+    --region "${REGION}" --no-progress || true
+
+touch /tmp/SPAWN_COMPLETE
+echo "=== Head node complete: $(date) (Nextflow exit: ${NF_EXIT}) ==="

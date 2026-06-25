@@ -27,6 +27,7 @@ import json
 import subprocess
 
 import boto3
+
 import config as cfg  # type: ignore[import]
 
 s3 = boto3.client("s3", region_name=cfg.REGION)

@@ -27,9 +27,8 @@ import time
 
 if importlib.util.find_spec("config") is None:
     sys.exit("config.py not found")
-import config as cfg  # type: ignore[import]
-
 import build_ami  # reuse the arch-aware _BAKE_SCRIPT verbatim
+import config as cfg  # type: ignore[import]
 
 BAKE_NAME = "omics-bake-x86"
 BAKE_INSTANCE_TYPE = "c7i.xlarge"  # x86 counterpart of the arm64 c7g.xlarge bake
