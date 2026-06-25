@@ -148,9 +148,11 @@ params {{
     // NOT containerised by Nextflow — it runs aws-cli on the host, bcftools in
     // Docker). Arch-correct: aarchbio on arm64, biocontainers on x86.
     bcftools_image = '{bcftools_image}'
-    // FSx mount on each task — CALL_VARIANTS reads the shared reference directly
-    // from <fsx_mount>/reference (zero-copy; nf-spawn ext.fsx mounts the FS).
+    // FSx mount on each task (where nf-spawn ext.fsx mounts the shared FS).
     fsx_mount = '{fsx_mount}'
+    // Absolute path to the reference FASTA on that mount (decoupled from the mount
+    // point: its location depends on how the S3→FSx DRA is scoped). .fai alongside.
+    reference_path = '{reference_path}'
 }}
 
 // S3 work directory — intermediate files pass between instances via S3.
@@ -328,6 +330,9 @@ def render(cfg, queue_size: int) -> str:
         reference_uri=reference_uri,
         bcftools_image=bcftools_image,
         fsx_mount=getattr(cfg, "FSX_MOUNT", "/fsx"),
+        reference_path=getattr(
+            cfg, "REFERENCE_PATH", getattr(cfg, "FSX_MOUNT", "/fsx") + "/reference"
+        ),
         inst_single=labels["process_single"],
         inst_low=labels["process_low"],
         inst_medium=labels["process_medium"],
