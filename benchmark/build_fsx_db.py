@@ -77,8 +77,14 @@ t1=$(T); JQADD reference_download_s "$(awk -v a=$t0 -v b=$t1 'BEGIN{print b-a}')
 GZ_BYTES=$(stat -c%s "$WORK/reference/$REFERENCE_NAME.gz"); JQADD reference_gz_bytes "$GZ_BYTES"
 
 # ── gunzip to the plain fasta ────────────────────────────────────────────────
+# The 1000genomes human_g1k_v37.fasta.gz carries trailing bytes after the gzip
+# member, so gunzip prints "decompression OK, trailing garbage ignored" and exits
+# NON-ZERO — which would trip `set -e`. The decompression itself is complete and
+# correct (verified: full 3.15 GB fasta, all contigs incl. '20'), so tolerate the
+# trailing-garbage exit (gzip returns 2 for warnings) while still failing on real
+# errors (gzip returns 1).
 t2=$(T)
-gunzip -f "$WORK/reference/$REFERENCE_NAME.gz"
+gunzip -f "$WORK/reference/$REFERENCE_NAME.gz" || [ $? -eq 2 ]
 t3=$(T); JQADD reference_gunzip_s "$(awk -v a=$t2 -v b=$t3 'BEGIN{print b-a}')"
 FA_BYTES=$(stat -c%s "$WORK/reference/$REFERENCE_NAME"); JQADD reference_fasta_bytes "$FA_BYTES"
 

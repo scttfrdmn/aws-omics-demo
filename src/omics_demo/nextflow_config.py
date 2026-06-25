@@ -144,6 +144,13 @@ params {{
     samples   = '{samples_uri}'
     reference = '{reference_uri}'
     regions   = '20'
+    // bcftools image for CALL_VARIANTS's explicit `docker run` (that process is
+    // NOT containerised by Nextflow — it runs aws-cli on the host, bcftools in
+    // Docker). Arch-correct: aarchbio on arm64, biocontainers on x86.
+    bcftools_image = '{bcftools_image}'
+    // FSx mount on each task — CALL_VARIANTS reads the shared reference directly
+    // from <fsx_mount>/reference (zero-copy; nf-spawn ext.fsx mounts the FS).
+    fsx_mount = '{fsx_mount}'
 }}
 
 // S3 work directory — intermediate files pass between instances via S3.
@@ -190,12 +197,12 @@ report {{
 # The x86 leg emits the upstream amd64 biocontainers (same versions; run native).
 _AARCHBIO_CONTAINER_OVERRIDES = """\
 // ── Native arm64 container overrides (quay.io/aarchbio) ──────────────────────
+// CALL_VARIANTS is NOT here: it runs aws-cli on the host + bcftools via explicit
+// `docker run` (params.bcftools_image), so Nextflow must not wrap it in a
+// container. MERGE_VCFS/VCF_STATS are pure-bcftools and run containerised.
 process {
-    withName: 'CALL_VARIANTS' { container = 'quay.io/aarchbio/bcftools:1.23.1--h89c24a7_0' }
-    withName: 'MERGE_VCFS'     { container = 'quay.io/aarchbio/bcftools:1.23.1--h89c24a7_0' }
-    withName: 'VCF_STATS'      { container = 'quay.io/aarchbio/bcftools:1.23.1--h89c24a7_0' }
-    // samtools (faidx/index) native arm64, if main.nf splits it into its own step:
-    // quay.io/aarchbio/samtools:1.23.1--hc7977f4_0
+    withName: 'MERGE_VCFS' { container = 'quay.io/aarchbio/bcftools:1.23.1--h89c24a7_0' }
+    withName: 'VCF_STATS'  { container = 'quay.io/aarchbio/bcftools:1.23.1--h89c24a7_0' }
 }
 """
 
@@ -204,12 +211,10 @@ process {
 # arch differs), keeping the benchmark a clean matched comparison.
 _BIOCONTAINER_CONTAINER_OVERRIDES = """\
 // ── x86 biocontainer images (quay.io/biocontainers, amd64 native) ────────────
+// CALL_VARIANTS not here — see arm64 note (host aws-cli + docker-run bcftools).
 process {
-    withName: 'CALL_VARIANTS' { container = 'quay.io/biocontainers/bcftools:1.23.1--hb2cee57_0' }
-    withName: 'MERGE_VCFS'     { container = 'quay.io/biocontainers/bcftools:1.23.1--hb2cee57_0' }
-    withName: 'VCF_STATS'      { container = 'quay.io/biocontainers/bcftools:1.23.1--hb2cee57_0' }
-    // samtools (faidx/index) amd64, if main.nf splits it into its own step:
-    // quay.io/biocontainers/samtools:1.23.1--ha83d96e_0
+    withName: 'MERGE_VCFS' { container = 'quay.io/biocontainers/bcftools:1.23.1--hb2cee57_0' }
+    withName: 'VCF_STATS'  { container = 'quay.io/biocontainers/bcftools:1.23.1--hb2cee57_0' }
 }
 """
 
@@ -239,6 +244,12 @@ def render(cfg, queue_size: int) -> str:
     ami_id_tools = tools_ami(cfg)
     container_overrides = (
         _AARCHBIO_CONTAINER_OVERRIDES if arch == "arm64" else _BIOCONTAINER_CONTAINER_OVERRIDES
+    )
+    # bcftools image for CALL_VARIANTS's explicit `docker run` (arch-correct).
+    bcftools_image = (
+        "quay.io/aarchbio/bcftools:1.23.1--h89c24a7_0"
+        if arch == "arm64"
+        else "quay.io/biocontainers/bcftools:1.23.1--hb2cee57_0"
     )
 
     # Pin every task to one AZ (nf-spawn 0.7.0 ext.az → spawn launch --az, the
@@ -315,6 +326,8 @@ def render(cfg, queue_size: int) -> str:
         az_line=az_line,
         samples_uri=samples_uri,
         reference_uri=reference_uri,
+        bcftools_image=bcftools_image,
+        fsx_mount=getattr(cfg, "FSX_MOUNT", "/fsx"),
         inst_single=labels["process_single"],
         inst_low=labels["process_low"],
         inst_medium=labels["process_medium"],

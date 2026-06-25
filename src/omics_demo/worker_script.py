@@ -82,17 +82,27 @@ params.reference = params.reference ?: 'reference'
 // Region restriction for demo speed. human_g1k_v37 names the contig '20'
 // (NOT 'chr20' — that is the hg19/GRCh38 'chr'-prefixed convention).
 params.regions   = params.regions   ?: '20'
+// bcftools container image for CALL_VARIANTS's explicit `docker run` (the process
+// is NOT containerised by Nextflow — see its header). Arch-specific default is
+// injected by nextflow_config; this fallback keeps main.nf runnable standalone.
+params.bcftools_image = params.bcftools_image ?: 'quay.io/biocontainers/bcftools:1.21--h8b25389_0'
+// FSx mount point on each task instance (nf-spawn ext.fsx); the shared reference
+// is read directly from <fsx_mount>/reference{,.fai}. Zero-copy, no path staging.
+params.fsx_mount = params.fsx_mount ?: '/fsx'
 
 process CALL_VARIANTS {
     label 'process_medium'
     tag { sample_id }
-    // The reference rides FSx (db_path marker → ext.fsx/ext.volumes symlink).
-    // bcftools/samtools come from the container (set in nextflow.config).
+    // NO container directive — like the microbiome FETCH_FASTQ process, this
+    // script runs ON THE HOST (which has aws-cli) and invokes the bcftools
+    // container EXPLICITLY via `docker run` for the bio-tool steps. A `container`
+    // directive would wrap the WHOLE script in the bcftools image, which has no
+    // aws-cli (→ exit 127 on `aws s3 cp`). Host does S3 I/O; container does bcftools.
 
     input:
     tuple val(sample_id), val(population), val(super_population), val(bam_path)
-    // The reference fasta + index, delivered read-only via the FSx mount.
-    tuple path(reference), path(reference_idx)
+    // The reference is read directly off the FSx mount inside the script (not a
+    // staged path input) — see the workflow block.
 
     output:
     tuple val(sample_id), val(population), val(super_population),
@@ -102,10 +112,7 @@ process CALL_VARIANTS {
     """
     set -euxo pipefail
 
-    # ── Environment provenance ───────────────────────────────────────────────
-    # Captured once so every timing below is interpretable: a given throughput
-    # is only meaningful qualified by instance type / network / placement. All
-    # probes are best-effort (|| fallback) so they never fail the sample.
+    # ── Environment provenance (host-side; all probes best-effort) ───────────
     TOK=\$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 120" 2>/dev/null || true)
     imds() { curl -sf -H "X-aws-ec2-metadata-token: \${TOK}" "http://169.254.169.254/latest/meta-data/\$1" 2>/dev/null; }
     INSTANCE_TYPE=\$(imds instance-type || echo unknown)
@@ -113,49 +120,45 @@ process CALL_VARIANTS {
     AZ=\$(imds placement/availability-zone || echo unknown)
     LIFECYCLE=\$(imds instance-life-cycle || echo unknown)
     VCPUS=\$(nproc 2>/dev/null || echo 0)
-    IFACE=\$(ip route show default 2>/dev/null | awk '/default/ {print \$5; exit}')
-    [ -n "\$IFACE" ] || IFACE=\$(ls /sys/class/net 2>/dev/null | grep -E '^(en|eth)' | head -1 || echo eth0)
-    NET_DRIVER=\$(ethtool -i "\$IFACE" 2>/dev/null | sed -n 's/^driver: //p' || echo unknown)
     UNAME_ARCH=\$(uname -m 2>/dev/null || echo unknown)
 
-    # ── Phase 1: pull the aligned BAM from s3://1000genomes (the staging cost) ─
-    # 1000 Genomes is in us-east-1 — same region as these instances, no egress
-    # charge. The BAMs are PRE-ALIGNED (no SRA fetch / no realignment needed).
+    # ── Phase 1 (HOST): pull the chrom20 BAM + its .bai from s3://1000genomes ─
+    # 1000 Genomes is in us-east-1 — same region, no egress charge. The BAMs are
+    # PRE-ALIGNED and the .bai sibling exists on S3, so we fetch BOTH and skip
+    # samtools entirely (the bcftools container has no samtools). aws-cli is on
+    # the host (this script is NOT containerised — see the process header).
     T0=\$(date +%s.%N)
     aws s3 cp ${bam_path} ./${sample_id}.bam \\
+        --no-sign-request --region us-east-1 --no-progress
+    aws s3 cp ${bam_path}.bai ./${sample_id}.bam.bai \\
         --no-sign-request --region us-east-1 --no-progress
     T1=\$(date +%s.%N)
     BAM_BYTES=\$(stat -c%s ./${sample_id}.bam 2>/dev/null || echo 0)
 
-    # ── Phase 2: index the BAM if it lacks a .bai ────────────────────────────
-    # bcftools mpileup needs a coordinate-sorted, indexed BAM. The 1000G
-    # low-coverage BAMs are sorted; their .bai is a sibling object on S3 that we
-    # do NOT fetch (we only stage the .bam), so index locally. (Matches the
-    # `if [ ! -f .bai ]; then samtools index` guard in the original omics-demo.)
-    if [ ! -f ./${sample_id}.bam.bai ]; then
-        samtools index ./${sample_id}.bam
-    fi
+    # ── Phase 2 (CONTAINER): call variants on chr20 via explicit docker run ──
+    # bcftools mpileup | call -mv, bgzipped, then tabix index. -r ${params.regions}
+    # limits to one contig for demo speed. The container mounts BOTH the work dir
+    # (PWD, holding the bam+bai) AND the FSx mount (read-only) so bcftools reads
+    # the shared reference + its real .fai DIRECTLY off FSx — genuinely zero-copy,
+    # and avoids the staged-marker .fai pitfall. FSX_MOUNT/reference{,.fai} are the
+    # real 3.15 GB FASTA + 2.7 KB index imported from S3.
+    BCFTOOLS_IMG='${params.bcftools_image}'
+    FSX='${params.fsx_mount}'
     T2=\$(date +%s.%N)
-
-    # ── Phase 3: call variants on chromosome 20 against the FSx-staged ref ────
-    # bcftools mpileup pipes straight into bcftools call -mv (multiallelic +
-    # variants-only), bgzipped output. -r ${params.regions} limits to one contig
-    # for demo speed. ${reference} is the symlinked FSx reference fasta; its
-    # .fai (${reference_idx}) is staged alongside so faidx isn't recomputed.
-    bcftools mpileup -f ${reference} -r ${params.regions} ./${sample_id}.bam \\
-        | bcftools call -mv -Oz -o ${sample_id}.vcf.gz
-    bcftools index -t ${sample_id}.vcf.gz
+    docker run --rm -v "\${PWD}:/work" -v "\${FSX}:\${FSX}:ro" -w /work "\${BCFTOOLS_IMG}" \\
+        sh -c "bcftools mpileup -f \${FSX}/reference -r ${params.regions} ./${sample_id}.bam \\
+               | bcftools call -mv -Oz -o ${sample_id}.vcf.gz && \\
+               bcftools index -t ${sample_id}.vcf.gz"
     T3=\$(date +%s.%N)
     VCF_BYTES=\$(stat -c%s ./${sample_id}.vcf.gz 2>/dev/null || echo 0)
     rm -f ./${sample_id}.bam ./${sample_id}.bam.bai
 
     # ── Emit per-sample data-movement timings (published to results/staging/) ─
     DL_S=\$(awk -v a=\$T0 -v b=\$T1 'BEGIN{printf "%.3f", b-a}')
-    IDX_S=\$(awk -v a=\$T1 -v b=\$T2 'BEGIN{printf "%.3f", b-a}')
     CALL_S=\$(awk -v a=\$T2 -v b=\$T3 'BEGIN{printf "%.3f", b-a}')
     DL_MBPS=\$(awk -v by=\$BAM_BYTES -v s=\$DL_S 'BEGIN{ if(s>0) printf "%.2f",(by/1048576)/s; else printf "0" }')
     cat > ${sample_id}.timings.json <<TIMINGS_EOF
-{"sample_id":"${sample_id}","population":"${population}","super_population":"${super_population}","instance_type":"\${INSTANCE_TYPE}","instance_id":"\${INSTANCE_ID}","az":"\${AZ}","lifecycle":"\${LIFECYCLE}","vcpus":\${VCPUS},"net_driver":"\${NET_DRIVER}","arch":"\${UNAME_ARCH}","bam_download_s":\${DL_S},"bam_bytes":\${BAM_BYTES},"bam_mbps":\${DL_MBPS},"samtools_index_s":\${IDX_S},"bcftools_call_s":\${CALL_S},"vcf_gz_bytes":\${VCF_BYTES}}
+{"sample_id":"${sample_id}","population":"${population}","super_population":"${super_population}","instance_type":"\${INSTANCE_TYPE}","instance_id":"\${INSTANCE_ID}","az":"\${AZ}","lifecycle":"\${LIFECYCLE}","vcpus":\${VCPUS},"arch":"\${UNAME_ARCH}","bam_download_s":\${DL_S},"bam_bytes":\${BAM_BYTES},"bam_mbps":\${DL_MBPS},"bcftools_call_s":\${CALL_S},"vcf_gz_bytes":\${VCF_BYTES}}
 TIMINGS_EOF
     aws s3 cp ${sample_id}.timings.json ${params.outdir}staging/${sample_id}.timings.json \\
         --region us-east-1 --no-progress || true
@@ -178,7 +181,13 @@ process MERGE_VCFS {
     script:
     """
     set -euxo pipefail
-    ls vcfs/*.vcf.gz > vcf_list.txt
+    # bcftools merge needs each VCF's tabix index NEXT TO the .vcf.gz. Nextflow
+    # stages the VCFs and their .tbi into SEPARATE dirs (vcfs/ and vcfs_idx/),
+    # both read-only mounts, so collect them together into a fresh writable dir.
+    mkdir -p merged_in
+    cp vcfs/*.vcf.gz merged_in/
+    cp vcfs_idx/*.tbi merged_in/
+    ls merged_in/*.vcf.gz > vcf_list.txt
     bcftools merge -l vcf_list.txt -Oz -o merged.vcf.gz
     bcftools index -t merged.vcf.gz
     echo "Completed merging of all per-sample VCFs"
@@ -202,13 +211,14 @@ process VCF_STATS {
     bcftools stats ${vcf} > stats.txt
 
     # Pull the population-genetics QC numbers out of the stats text. The 'SN'
-    # (summary numbers) lines are tab-separated; the value is the last field, so
-    # we key on the trailing label and take \$NF (avoids hard-coding a column or
-    # embedding a tab/regex escape). The ts/tv ratio prints on its own SN line.
-    SNPS=\$(grep -m1 "number of SNPs:" stats.txt | awk '{print \$NF}')
-    INDELS=\$(grep -m1 "number of indels:" stats.txt | awk '{print \$NF}')
-    RECORDS=\$(grep -m1 "number of records:" stats.txt | awk '{print \$NF}')
-    TSTV=\$(grep -m1 "ts/tv:" stats.txt | awk '{print \$NF}')
+    # (summary numbers) lines are tab-separated, value in the last field. The
+    # ts/tv ratio is NOT an SN line — it's the 'TSTV' data row whose columns are
+    # [TSTV][id][ts][tv][ts/tv]..., so ts/tv is field 5. All greps are `|| true`
+    # so a missing line never trips `set -e`; defaults fill in afterward.
+    SNPS=\$(grep -m1 "number of SNPs:" stats.txt | awk '{print \$NF}' || true)
+    INDELS=\$(grep -m1 "number of indels:" stats.txt | awk '{print \$NF}' || true)
+    RECORDS=\$(grep -m1 "number of records:" stats.txt | awk '{print \$NF}' || true)
+    TSTV=\$(grep -m1 -E "^TSTV" stats.txt | awk -F'\\t' '{print \$5}' || true)
     : "\${SNPS:=0}" "\${INDELS:=0}" "\${RECORDS:=0}" "\${TSTV:=0}"
 
     cat > stats.json <<STATS_EOF
@@ -226,15 +236,13 @@ workflow {
         .map { row -> [ row.sample_id, row.population, row.super_population, row.bam_path ] }
         .set { samples_ch }
 
-    // The shared reference fasta + .fai (db_path marker → FSx symlink on task).
-    // .first() so every CALL_VARIANTS task reads the same singleton reference.
-    Channel
-        .of( tuple( file("${params.reference}"), file("${params.reference}.fai") ) )
-        .first()
-        .set { reference_ch }
-
-    // Fan-out: one nf-spawn EC2 instance per sample.
-    CALL_VARIANTS(samples_ch, reference_ch)
+    // Fan-out: one nf-spawn EC2 instance per sample. The shared reference is read
+    // DIRECTLY off the FSx mount (params.fsx_mount/reference + .fai) inside the
+    // task — not staged as a Nextflow path input. nf-spawn mounts the FSx
+    // filesystem on every task instance (ext.fsx), so this is genuinely zero-copy
+    // and avoids the staged-marker/.fai pitfall (the s3:// marker is a 78-byte
+    // placeholder, not the real .fai). See CALL_VARIANTS.
+    CALL_VARIANTS(samples_ch)
 
     // Fan-in: collect all per-sample VCFs + indexes, merge into one cohort VCF.
     CALL_VARIANTS.out.map { it[3] }.collect().set { vcfs_ch }
@@ -290,14 +298,34 @@ fi
 TARGET_NF_SPAWN_VERSION="0.8.0"
 NF_PLUGIN_DIR="/opt/nextflow_cache/plugins"
 NF_SPAWN_PLUGIN_DIR="${NF_PLUGIN_DIR}/nf-spawn-${TARGET_NF_SPAWN_VERSION}"
-if [ ! -d "${NF_SPAWN_PLUGIN_DIR}/classes" ]; then
-    echo "Installing nf-spawn v${TARGET_NF_SPAWN_VERSION} from release ZIP..."
+# Reinstall unless a VALID plugin is present. A dir check alone is insufficient:
+# the baked AMI can ship a zero-byte MANIFEST.MF (observed — AMI snapshot captured
+# the FS before files flushed), which makes Nextflow fail plugin load with
+# "Field 'id' cannot be empty". So require a non-empty MANIFEST with a Plugin-Id.
+NF_SPAWN_MANIFEST="${NF_SPAWN_PLUGIN_DIR}/classes/META-INF/MANIFEST.MF"
+if [ ! -s "${NF_SPAWN_MANIFEST}" ] || ! grep -q '^Plugin-Id:' "${NF_SPAWN_MANIFEST}" 2>/dev/null; then
+    echo "Installing nf-spawn v${TARGET_NF_SPAWN_VERSION} (no valid cached plugin)..."
     ZIP_URL="https://github.com/spore-host/nf-spawn/releases/download/v${TARGET_NF_SPAWN_VERSION}/nf-spawn-${TARGET_NF_SPAWN_VERSION}.zip"
+    rm -rf "${NF_SPAWN_PLUGIN_DIR}"
     mkdir -p "${NF_SPAWN_PLUGIN_DIR}"
     curl -fsSL "${ZIP_URL}" -o /tmp/nf-spawn.zip
     unzip -q /tmp/nf-spawn.zip -d "${NF_SPAWN_PLUGIN_DIR}"
     rm /tmp/nf-spawn.zip
     echo "nf-spawn ${TARGET_NF_SPAWN_VERSION} installed."
+fi
+# Same defensive check for the Nextflow framework jar + nf-amazon (both seen
+# zero-byte on the baked AMI). Force a clean re-fetch if the jar is empty.
+NXF_JAR=$(find /opt/nextflow_cache/framework -name 'nextflow-*-one.jar' 2>/dev/null | head -1)
+if [ -z "${NXF_JAR}" ] || [ ! -s "${NXF_JAR}" ]; then
+    echo "Nextflow framework jar missing/empty — forcing clean fetch..."
+    rm -rf /opt/nextflow_cache/framework
+    NXF_HOME=/opt/nextflow_cache /usr/local/bin/nextflow -version >/dev/null 2>&1 || true
+fi
+NF_AMAZON_MANIFEST=$(find /opt/nextflow_cache/plugins/nf-amazon-* -name MANIFEST.MF 2>/dev/null | head -1)
+if [ -z "${NF_AMAZON_MANIFEST}" ] || [ ! -s "${NF_AMAZON_MANIFEST}" ]; then
+    echo "nf-amazon plugin missing/empty — reinstalling..."
+    rm -rf /opt/nextflow_cache/plugins/nf-amazon-*
+    NXF_HOME=/opt/nextflow_cache /usr/local/bin/nextflow plugin install nf-amazon@2.8.0 >/dev/null 2>&1 || true
 fi
 
 # ── Upgrade spawn CLI to latest release ──────────────────────────────────────

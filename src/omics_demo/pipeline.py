@@ -225,19 +225,23 @@ def reference_marker_s3_uri(cfg, ref_name: str = "reference") -> str:
 
 
 def write_reference_marker(cfg, ref_name: str = "reference") -> None:
-    """Create the marker object backing the reference db_path s3:// URI.
+    """Create the marker objects backing the reference db_path s3:// URIs.
 
-    main.nf types params.reference as a path that must exist, so the URI must
-    resolve to something. We write a zero-byte marker AT the reference key
-    itself; the task-side symlink replaces it with the real mounted FSx/EBS
-    reference, so the marker content is never read.
+    main.nf consumes the reference as TWO staged path inputs — the FASTA
+    (`${params.reference}`) AND its index (`${params.reference}.fai`) — so BOTH
+    s3:// URIs must resolve to an object, else nf-spawn's input staging fails
+    ("failed to stage input reference.fai") and the task never runs. We write a
+    tiny marker at each key; the task-side symlink (#55) replaces them with the
+    real mounted FSx/EBS reference + index, so the marker contents are never read.
     """
     s3 = boto3.client("s3", region_name=cfg.REGION)
-    s3.put_object(
-        Bucket=cfg.BUCKET,
-        Key=f"{reference_marker_prefix(cfg)}/{ref_name}",
-        Body=b"nf-spawn ext.fsx/ext.volumes marker - real reference is on the mounted volume\n",
-    )
+    body = b"nf-spawn ext.fsx/ext.volumes marker - real reference is on the mounted volume\n"
+    for key_suffix in (ref_name, f"{ref_name}.fai"):
+        s3.put_object(
+            Bucket=cfg.BUCKET,
+            Key=f"{reference_marker_prefix(cfg)}/{key_suffix}",
+            Body=body,
+        )
 
 
 def clear_reference_marker(cfg) -> None:
