@@ -25,6 +25,12 @@ trace_key = f"results/{job_name}/trace.tsv"
 prog_key = f"results/{job_name}/progress.json"
 nf_pid = int(sys.argv[1])
 
+# On-demand $/hr for the cost meter, injected by worker_script.render() from
+# pricing.instance_rates(). HEAD_RATE = this head's instance; TASK_RATE = the
+# CALL_VARIANTS (process_medium) instance — the fan-out term that dominates cost.
+HEAD_RATE_USD_HR = float("@@HEAD_RATE@@")
+TASK_RATE_USD_HR = float("@@TASK_RATE@@")
+
 # Load the population map from the sample list so we can annotate stats later.
 with open("/tmp/nf-head/sample_list.json") as f:
     sample_list = json.load(f)
@@ -71,6 +77,8 @@ def read_stats_json():
 
 
 started_at = time.time()
+last_tick = started_at
+cost_usd = 0.0  # accumulated, monotonic — a Riemann sum of the burn rate
 
 while True:
     time.sleep(15)
@@ -85,6 +93,17 @@ while True:
     failed = sum(1 for t in tasks if t.get("status") in ("FAILED", "ABORTED"))
     total = len(tasks)
 
+    # ── Cost: integrate the burn rate over this poll interval ────────────────
+    # At each tick, the instantaneous burn is the head + every currently-RUNNING
+    # task instance. Accumulating (rate × dt) over the actual intervals gives the
+    # real billed instance-seconds — monotonic, and correct regardless of how the
+    # running count rises/falls (unlike running_count × total_elapsed). The head
+    # bills the whole run; task instances only while RUNNING.
+    now = time.time()
+    dt_hr = (now - last_tick) / 3600.0
+    last_tick = now
+    cost_usd += (HEAD_RATE_USD_HR + running * TASK_RATE_USD_HR) * dt_hr
+
     # Data volumes from the trace rchar/wchar fields on the CALL_VARIANTS tasks.
     call_tasks = [t for t in tasks if is_call_task(t.get("name", ""))]
     bam_bytes = sum(parse_rchar(t.get("rchar", "0")) for t in call_tasks)
@@ -93,13 +112,14 @@ while True:
     progress = {
         "status": "complete" if pipeline_done else "running",
         "started_at": started_at,
-        "elapsed_seconds": time.time() - started_at,
+        "elapsed_seconds": now - started_at,
         "tasks_total": total,
         "tasks_running": running,
         "tasks_done": done,
         "tasks_failed": failed,
         "bam_bytes_read": bam_bytes,
         "vcf_bytes": vcf_bytes,
+        "ec2_cost_usd": round(cost_usd, 6),
         "stats": read_stats_json() or {},
     }
 

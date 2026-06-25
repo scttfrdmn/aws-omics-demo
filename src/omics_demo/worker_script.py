@@ -76,13 +76,32 @@ def upload_main_nf(cfg) -> str:
     return key
 
 
+def _cost_rates(cfg) -> tuple[float, float]:
+    """(head $/hr, task $/hr) for the monitor's live cost integral.
+
+    Real on-demand rates via pricing.instance_rates (live truffle + fallback).
+    head = HEAD_INSTANCE_TYPE; task = the CALL_VARIANTS (process_medium) instance,
+    the fan-out term that dominates cost at N=100.
+    """
+    from . import nextflow_config, pricing
+
+    head_type = getattr(cfg, "HEAD_INSTANCE_TYPE", "c7g.large")
+    labels = nextflow_config._LABEL_INSTANCE_TYPES_BY_ARCH[nextflow_config._arch(cfg)]
+    task_type = labels["process_medium"]
+    rates = pricing.instance_rates([head_type, task_type], cfg.REGION)
+    return rates.get(head_type, 0.0723), rates.get(task_type, 0.289)
+
+
 def upload_monitor(cfg) -> str:
     """Upload pipeline/monitor.py (with @@TOKEN@@ substituted) to S3, return key."""
+    head_rate, task_rate = _cost_rates(cfg)
     body = (
         _read("monitor.py")
         .replace(_TOK_REGION, cfg.REGION)
         .replace(_TOK_BUCKET, cfg.BUCKET)
         .replace(_TOK_JOB_NAME, cfg.JOB_NAME)
+        .replace("@@HEAD_RATE@@", f"{head_rate:.6f}")
+        .replace("@@TASK_RATE@@", f"{task_rate:.6f}")
     )
     s3 = boto3.client("s3", region_name=cfg.REGION)
     key = f"pipeline/{cfg.JOB_NAME}/monitor.py"

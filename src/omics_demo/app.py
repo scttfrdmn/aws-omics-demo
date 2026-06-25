@@ -438,29 +438,45 @@ def _run_fake_pipeline() -> None:
         step("Head node booting, pulling bcftools/samtools containers…", delay=2.0)
         step("Nextflow started — dispatching CALL_VARIANTS tasks via nf-spawn…", delay=1.0)
 
-        # Simulate rolling progress over ~20 seconds. Numbers are illustrative
-        # placeholders for UI rehearsal — the demo has never been run.
+        # Simulate rolling progress for UI rehearsal. Counts/timings are
+        # illustrative; the COST uses the same accumulating burn-rate integral as
+        # the real monitor (head + running tasks) × fallback on-demand rates, so
+        # the rehearsed meter behaves like the live one.
+        from . import pricing
+
+        total = getattr(cfg, "SAMPLE_COUNT", 100)
+        head_type = getattr(cfg, "HEAD_INSTANCE_TYPE", "c7g.large")
+        _arm = getattr(cfg, "BENCH_ARCH", "arm64") == "arm64"
+        task_type = "c7g.2xlarge" if _arm else "c7i.2xlarge"
+        rates = pricing.instance_rates([head_type, task_type], getattr(cfg, "REGION", "us-east-1"))
+        head_rate = rates.get(head_type, 0.0723)
+        task_rate = rates.get(task_type, 0.289)
+
         start_time = time.time()
-        variant_counts: dict = {}
-        total = 30
+        variant_counts = {}
+        ec2_cost = 0.0
+        last = start_time
 
         for tick in range(20):
-            elapsed = time.time() - start_time
-            done = min(total, int(tick * 1.65))
+            now = time.time()
+            elapsed = now - start_time
+            done = min(total, int(tick / 19 * total))
             running = min(queue_size, total - done)
-            ec2_cost = elapsed / 3600 * (0.0168 + queue_size * 0.6528 * 0.4)
+            # Accumulate cost as a Riemann sum of the burn rate (matches monitor.py).
+            ec2_cost += (head_rate + running * task_rate) * (now - last) / 3600.0
+            last = now
 
             # Reveal a per-super-population headline as samples complete. These
             # are illustrative placeholders only — not measured variant calls.
-            if done > 3 and "AFR" not in variant_counts:
+            if done > total * 0.1 and "AFR" not in variant_counts:
                 variant_counts["AFR"] = ["chr20 SNPs called", "indels called"]
-            if done > 12 and "EUR" not in variant_counts:
+            if done > total * 0.4 and "EUR" not in variant_counts:
                 variant_counts["EUR"] = ["chr20 SNPs called", "indels called"]
-            if done > 21 and "EAS" not in variant_counts:
+            if done > total * 0.7 and "EAS" not in variant_counts:
                 variant_counts["EAS"] = ["chr20 SNPs called", "indels called"]
 
-            bam_gb = done * 1.0  # ~1 GB low-coverage BAM streamed per sample
-            vcf_gb = bam_gb * 0.002  # tiny chr20 VCF (BAM streams through)
+            bam_gb = done * 0.3  # ~0.3 GB chr20 low-coverage BAM streamed per sample
+            vcf_gb = bam_gb * 0.008  # tiny chr20 VCF (BAM streams through)
 
             emit(
                 {

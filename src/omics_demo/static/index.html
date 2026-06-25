@@ -53,6 +53,33 @@
     header h1 { font-size: 1.1rem; font-weight: 700; letter-spacing: 0.01em; }
     header .sub { font-size: 0.82rem; color: var(--muted); }
 
+    /* Hero headline — the talk's payoff line. Big, centered, tabular numerals. */
+    .hero {
+      text-align: center;
+      padding: 22px 32px;
+      border-bottom: 1px solid var(--border);
+      background: linear-gradient(180deg, var(--surface), var(--bg));
+    }
+    .hero-num {
+      display: block;
+      font-size: 2.6rem;
+      font-weight: 800;
+      color: var(--green);
+      font-variant-numeric: tabular-nums;
+      letter-spacing: 0.01em;
+      line-height: 1.1;
+    }
+    .hero-cap { font-size: 0.9rem; color: var(--muted); }
+    .hero-final .hero-num {
+      font-size: 3.4rem;
+      text-shadow: 0 0 24px rgba(63, 185, 80, 0.35);
+      animation: heroPop 0.6s ease;
+    }
+    @keyframes heroPop {
+      0%   { transform: scale(0.92); opacity: 0; }
+      100% { transform: scale(1); opacity: 1; }
+    }
+
     .badge {
       display: inline-block;
       padding: 2px 8px;
@@ -266,7 +293,7 @@
 <header>
   <div>
     <h1>1000 Genomes Variant Calling</h1>
-    <div class="sub">30 samples · 3 super-populations (AFR/EUR/EAS) · bcftools (chr20) · nf-spawn per-task EC2</div>
+    <div class="sub" x-text="`${tasksTotal || 'up to 100'} samples · 3 super-populations (AFR/EUR/EAS) · bcftools (chr20) · nf-spawn per-task EC2`"></div>
     <div class="sub" style="color: var(--teal); font-size: 0.75rem; margin-top: 2px;">
       Data: <strong>1000 Genomes Open Data</strong> — low-coverage BAMs read directly, nothing copied, $0 data cost
     </div>
@@ -281,6 +308,14 @@
     <span class="badge badge-red">✗ Error</span>
   </template>
 </header>
+
+<!-- ── Hero headline: the talk's payoff — "N genomes · X min · $Y" ──── -->
+<div class="hero" x-show="headline"
+     :class="status === 'complete' ? 'hero-final' : ''">
+  <span class="hero-num" x-text="headline"></span>
+  <span class="hero-cap" x-show="status === 'complete'">sequenced &amp; variant-called on AWS</span>
+  <span class="hero-cap" x-show="status === 'running'">and counting…</span>
+</div>
 
 <!-- ── Main ───────────────────────────────────────────────────────── -->
 <main>
@@ -483,8 +518,20 @@ function demo() {
     // quota
     quotaSummary: '',
 
+    // The talk's payoff line: "N genomes · X min · $Y". Live while running
+    // (genomes done so far), final + emphatic on completion.
+    get headline() {
+      const n = this.status === 'complete' ? this.tasksDone : (this.tasksDone || this.tasksTotal);
+      if (!n) return '';
+      const genomes = `${n} genome${n === 1 ? '' : 's'}`;
+      const mins = this.elapsedSec >= 60
+        ? `${Math.floor(this.elapsedSec / 60)}m ${Math.round(this.elapsedSec % 60)}s`
+        : `${Math.round(this.elapsedSec)}s`;
+      const cost = `$${this.ec2Cost.toFixed(2)}`;
+      return `${genomes} · ${mins} · ${cost}`;
+    },
     get costSub() {
-      return 'Nextflow head (t4g.small) + task instances';
+      return 'Nextflow head + per-task EC2 instances (real on-demand rates)';
     },
     get elapsedSub() {
       if (!this.progress) return '';

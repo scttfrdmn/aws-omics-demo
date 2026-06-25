@@ -113,17 +113,11 @@ def poll_progress(cfg, start_time: float, queue_size: int) -> PipelineProgress:
     p.tasks_done = raw.get("tasks_done", 0)
     p.tasks_failed = raw.get("tasks_failed", 0)
 
-    # Cost: head node + actually-running task instances.
-    # Use blended average of task instance prices from truffle.
-    from . import nextflow_config as _nfc
-
-    task_specs = _truffle.get_instance_specs(_nfc.all_instance_types(cfg), cfg.REGION)
-    avg_task_price = (
-        sum(s.on_demand_price_usd for s in task_specs.values()) / len(task_specs)
-        if task_specs
-        else 0.0
-    )
-    p.ec2_cost_usd = (elapsed / 3600) * (head_price + p.tasks_running * avg_task_price)
+    # Cost is computed AUTHORITATIVELY on the head (monitor.py), which integrates
+    # the burn rate over its real poll intervals (head + running tasks) into a
+    # monotonic ec2_cost_usd. Read it through; only fall back to a head-only
+    # estimate before the monitor has written its first value.
+    p.ec2_cost_usd = raw.get("ec2_cost_usd", (elapsed / 3600) * head_price)
 
     # data_volumes key used in summary.json; flat in progress.json
     dv = raw.get("data_volumes") or raw
