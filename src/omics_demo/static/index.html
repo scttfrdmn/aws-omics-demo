@@ -163,21 +163,34 @@
       border-top: 1px solid var(--border);
       background: var(--surface);
     }
-    .btn-start {
-      width: 100%;
-      padding: 12px 24px;
-      background: var(--green);
-      color: #0d1117;
-      border: none;
+    /* Speaker console: Provision / Start / Reset / Teardown */
+    .infra-line { font-size: 0.95rem; color: var(--muted); margin-bottom: 10px; }
+    .infra-line .st-grey  { color: var(--muted); }
+    .infra-line .st-amber { color: var(--amber); }
+    .infra-line .st-green { color: var(--green); }
+    .console-btns {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .btn {
+      padding: 12px 16px;
+      border: 1px solid var(--border);
       border-radius: 8px;
       font-family: var(--font);
       font-size: 1rem;
       font-weight: 700;
       cursor: pointer;
-      transition: opacity .15s;
+      transition: opacity .15s, filter .15s;
+      color: #0d1117;
     }
-    .btn-start:disabled { opacity: .4; cursor: not-allowed; }
-    .btn-start:hover:not(:disabled) { opacity: .85; }
+    .btn:disabled { opacity: .35; cursor: not-allowed; }
+    .btn:hover:not(:disabled) { filter: brightness(1.1); }
+    .btn-start    { background: var(--green); }
+    .btn-provision{ background: var(--blue); }
+    .btn-reset    { background: var(--amber); }
+    .btn-teardown { background: var(--red); color: #fff; }
 
     .phase-line {
       margin-top: 10px;
@@ -302,7 +315,7 @@
   </style>
 </head>
 
-<body x-data="demo()" x-init="init()">
+<body x-data="demo()">
 
 <!-- ── Fixed top region: header + hero stay locked while the feed scrolls ── -->
 <div class="topbar">
@@ -370,12 +383,47 @@
     </div>
 
     <div class="start-area">
-      <button class="btn-start"
-              :disabled="status === 'running'"
-              @click="startRun()">
-        <span x-show="status !== 'running'">▶  Start Analysis</span>
-        <span x-show="status === 'running'">● Running…</span>
-      </button>
+      <!-- Speaker console: drive the whole lifecycle from the page, no CLI.
+           Provision (green-room) → Start (live) → Reset (rehearse again) ;
+           Teardown always available. -->
+      <div class="infra-line">
+        Infrastructure:
+        <strong :class="{
+          'st-grey': infra === 'not_provisioned',
+          'st-amber': infra === 'provisioning' || infra === 'tearing_down',
+          'st-green': infra === 'provisioned'}"
+          x-text="infraLabel"></strong>
+      </div>
+
+      <div class="console-btns">
+        <button class="btn btn-provision"
+                :disabled="infra !== 'not_provisioned'"
+                @click="provision()">
+          <span x-show="infra !== 'provisioning'">① Provision</span>
+          <span x-show="infra === 'provisioning'">● Provisioning…</span>
+        </button>
+
+        <button class="btn btn-start"
+                :disabled="infra !== 'provisioned' || status === 'running'"
+                @click="startRun()">
+          <span x-show="status !== 'running'">② Start</span>
+          <span x-show="status === 'running'">● Running…</span>
+        </button>
+
+        <button class="btn btn-reset"
+                :disabled="status === 'running' || infra !== 'provisioned'"
+                @click="resetRun()"
+                title="Clear the run, keep FSx — rehearse, reset, present live">
+          ↺ Reset
+        </button>
+
+        <button class="btn btn-teardown"
+                :disabled="infra === 'not_provisioned' || infra === 'tearing_down'"
+                @click="teardown()"
+                title="Delete FSx + terminate instances">
+          ✕ Teardown
+        </button>
+      </div>
 
       <div class="phase-line" x-text="phase"></div>
       <div class="quota-line" x-show="quotaSummary" x-text="quotaSummary"></div>
@@ -451,6 +499,24 @@
       </table>
     </div>
 
+    <!-- Live genomes-called by super-population (animates DURING the run) -->
+    <div class="panel-section" x-show="Object.keys(popDone).length > 0">
+      <h3>Genomes called (live)</h3>
+      <template x-for="grp in ['AFR','EUR','EAS']" :key="grp">
+        <div x-show="popDone[grp]" style="margin-bottom: 8px;">
+          <div style="display:flex;justify-content:space-between;font-size:0.9rem;">
+            <span x-text="fmtGroup(grp)"></span>
+            <span style="font-variant-numeric:tabular-nums;color:var(--green)"
+                  x-text="`${popDone[grp] || 0}`"></span>
+          </div>
+          <div class="progress-wrap">
+            <div class="progress-fill"
+                 :style="`width:${Math.min(100,(popDone[grp]||0)/(tasksTotal/3||1)*100).toFixed(0)}%`"></div>
+          </div>
+        </div>
+      </template>
+    </div>
+
     <!-- Per-super-population variant preview -->
     <div class="panel-section" x-show="Object.keys(variantCounts).length > 0">
       <h3>Variant Calls (live)</h3>
@@ -504,6 +570,7 @@ function demo() {
   return {
     // state
     status: 'idle',
+    infra: 'not_provisioned',  // not_provisioned | provisioning | provisioned | tearing_down
     phase: '',
     progress: null,
     ec2Cost: 0,
@@ -513,6 +580,7 @@ function demo() {
     instanceType: 'c7g.2xlarge',
     instanceStatuses: {},
     variantCounts: {},
+    popDone: {},
     insight: '',
     receipt: [],
     events: [],
@@ -563,6 +631,21 @@ function demo() {
 
     init() {
       this._connectWs();
+      // Sync infra/run state on load so a reconnecting page (or one opened
+      // mid-provision) shows the right button states.
+      fetch('/api/status').then(r => r.json()).then(s => {
+        if (s.infra) this.infra = s.infra;
+        if (s.status) this.status = s.status;
+      }).catch(() => {});
+    },
+
+    get infraLabel() {
+      return {
+        not_provisioned: 'not provisioned',
+        provisioning: 'provisioning…',
+        provisioned: 'ready ✓',
+        tearing_down: 'tearing down…',
+      }[this.infra] || this.infra;
     },
 
     _connectWs() {
@@ -626,6 +709,9 @@ function demo() {
           if (ev.variant_counts) {
             this.variantCounts = ev.variant_counts;
           }
+          if (ev.pop_done) {
+            this.popDone = ev.pop_done;
+          }
           if (ev.instance_statuses) {
             this.instanceStatuses = ev.instance_statuses;
           }
@@ -656,6 +742,26 @@ function demo() {
           this._stopTicker();
           this._buildReceipt();
           this._addEvent('Done', '✓ Run complete', now);
+          break;
+
+        case 'provisioned':
+          this.infra = 'provisioned';
+          this._addEvent('Infra', `✓ FSx ready: ${ev.fsx_id}`, now);
+          break;
+
+        case 'reset_done':
+          // Back to a clean run state; FSx stays. Clear the live panels.
+          this.progress = null; this.ec2Cost = 0; this.elapsedSec = 0;
+          this.tasksDone = 0; this.tasksRunning = 0; this.variantCounts = {};
+          this.receipt = []; this.insight = ''; this.status = 'idle';
+          this._addEvent('Reset', '↺ Run cleared — FSx kept, ready to run again', now);
+          break;
+
+        case 'teardown_done':
+          this.infra = 'not_provisioned';
+          this._addEvent('Teardown',
+            `✕ FSx deleted${ev.fsx_deleted ? ' (' + ev.fsx_deleted + ')' : ''}, ` +
+            `${(ev.instances_terminated || []).length} instance(s) terminated`, now);
           break;
 
         case 'error':
@@ -748,6 +854,27 @@ function demo() {
         this.status = 'error';
         this.phase = 'Failed to reach server: ' + e.message;
       }
+    },
+
+    async provision() {
+      this.infra = 'provisioning';
+      this.phase = 'Provisioning FSx…';
+      try { await fetch('/api/provision', {method: 'POST'}); }
+      catch (e) { this.infra = 'not_provisioned'; this.phase = 'Provision failed: ' + e.message; }
+    },
+
+    async resetRun() {
+      this.phase = 'Resetting…';
+      try { await fetch('/api/reset', {method: 'POST'}); }
+      catch (e) { this.phase = 'Reset failed: ' + e.message; }
+    },
+
+    async teardown() {
+      if (!confirm('Delete the FSx filesystem and terminate all demo instances?')) return;
+      this.infra = 'tearing_down';
+      this.phase = 'Tearing down…';
+      try { await fetch('/api/teardown', {method: 'POST'}); }
+      catch (e) { this.phase = 'Teardown failed: ' + e.message; }
     },
 
     fmtElapsed(sec) {

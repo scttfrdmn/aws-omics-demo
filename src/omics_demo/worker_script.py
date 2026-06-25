@@ -76,12 +76,14 @@ def upload_main_nf(cfg) -> str:
     return key
 
 
-def _cost_rates(cfg) -> tuple[float, float]:
-    """(head $/hr, task $/hr) for the monitor's live cost integral.
+def _cost_rates(cfg) -> tuple[float, float, float]:
+    """(head $/hr, task $/hr, fsx $/hr) for the monitor's live cost integral.
 
-    Real on-demand rates via pricing.instance_rates (live truffle + fallback).
-    head = HEAD_INSTANCE_TYPE; task = the CALL_VARIANTS (process_medium) instance,
-    the fan-out term that dominates cost at N=100.
+    EC2 rates via pricing.instance_rates (live truffle + fallback). head =
+    HEAD_INSTANCE_TYPE; task = the CALL_VARIANTS (process_medium) instance, the
+    fan-out term that dominates cost at N=100. fsx = the shared FSx for Lustre
+    storage charge (PERSISTENT_2 SSD: $/GB-month × capacity / 730 hr) — a flat
+    term billed for the whole run window, so the headline "$Y" is all-in.
     """
     from . import nextflow_config, pricing
 
@@ -89,12 +91,15 @@ def _cost_rates(cfg) -> tuple[float, float]:
     labels = nextflow_config._LABEL_INSTANCE_TYPES_BY_ARCH[nextflow_config._arch(cfg)]
     task_type = labels["process_medium"]
     rates = pricing.instance_rates([head_type, task_type], cfg.REGION)
-    return rates.get(head_type, 0.0723), rates.get(task_type, 0.289)
+    # FSx PERSISTENT_2 SSD storage: ~$0.145/GB-month in us-east-1.
+    fsx_gib = getattr(cfg, "FSX_STORAGE_GIB", 1200)
+    fsx_rate = fsx_gib * getattr(cfg, "FSX_USD_GB_MONTH", 0.145) / 730.0
+    return rates.get(head_type, 0.0723), rates.get(task_type, 0.289), fsx_rate
 
 
 def upload_monitor(cfg) -> str:
     """Upload pipeline/monitor.py (with @@TOKEN@@ substituted) to S3, return key."""
-    head_rate, task_rate = _cost_rates(cfg)
+    head_rate, task_rate, fsx_rate = _cost_rates(cfg)
     body = (
         _read("monitor.py")
         .replace(_TOK_REGION, cfg.REGION)
@@ -102,6 +107,7 @@ def upload_monitor(cfg) -> str:
         .replace(_TOK_JOB_NAME, cfg.JOB_NAME)
         .replace("@@HEAD_RATE@@", f"{head_rate:.6f}")
         .replace("@@TASK_RATE@@", f"{task_rate:.6f}")
+        .replace("@@FSX_RATE@@", f"{fsx_rate:.6f}")
     )
     s3 = boto3.client("s3", region_name=cfg.REGION)
     key = f"pipeline/{cfg.JOB_NAME}/monitor.py"

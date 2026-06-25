@@ -13,6 +13,7 @@ before this file is shipped to the head node. Invoked as:
 
 import json
 import os
+import re
 import sys
 import time
 
@@ -28,8 +29,12 @@ nf_pid = int(sys.argv[1])
 # On-demand $/hr for the cost meter, injected by worker_script.render() from
 # pricing.instance_rates(). HEAD_RATE = this head's instance; TASK_RATE = the
 # CALL_VARIANTS (process_medium) instance — the fan-out term that dominates cost.
+# FSX_RATE = the shared FSx for Lustre filesystem's hourly storage charge, which
+# bills the whole run window regardless of task count (a flat term in the integral)
+# so the headline "$Y" is true all-in spend (EC2 + FSx), not compute-only.
 HEAD_RATE_USD_HR = float("@@HEAD_RATE@@")
 TASK_RATE_USD_HR = float("@@TASK_RATE@@")
+FSX_RATE_USD_HR = float("@@FSX_RATE@@")
 
 # Load the population map from the sample list so we can annotate stats later.
 with open("/tmp/nf-head/sample_list.json") as f:
@@ -37,8 +42,42 @@ with open("/tmp/nf-head/sample_list.json") as f:
 pop_map = {item["sample_id"]: item.get("super_population", "unknown") for item in sample_list}
 
 
+# The head's local .nextflow.log carries LIVE per-task lifecycle lines as they
+# happen — unlike the S3 trace.tsv, which only finalises near the end on the spawn
+# executor (so a trace-based monitor sits at 0/0 the whole run, then jumps to done).
+# We parse the log for real-time counts so the dashboard actually animates.
+_NF_LOG = "/tmp/nf-head/.nextflow.log"
+_RE_SUBMIT = re.compile(r"Submitting task '([^']+)' to spawn instance '([^']+)'")
+_RE_DONE = re.compile(r"Task '([^']+)' completed \(exit (\d+)\) on instance '([^']+)'")
+
+
+def read_log_tasks():
+    """Return (submitted, completed, failed) name-sets parsed from .nextflow.log.
+
+    submitted/completed are sets of task display names (e.g. "CALL_VARIANTS (HG01879)")
+    so running = submitted − completed and counts can't double-count on log replay.
+    failed = completed with a non-zero exit code.
+    """
+    submitted, completed, failed = set(), set(), set()
+    try:
+        with open(_NF_LOG, errors="ignore") as f:
+            for line in f:
+                m = _RE_SUBMIT.search(line)
+                if m:
+                    submitted.add(m.group(1))
+                    continue
+                m = _RE_DONE.search(line)
+                if m:
+                    completed.add(m.group(1))
+                    if m.group(2) != "0":
+                        failed.add(m.group(1))
+    except OSError:
+        pass
+    return submitted, completed, failed
+
+
 def read_trace():
-    # Parse the Nextflow trace TSV and return a list of task dicts.
+    # Parse the Nextflow trace TSV (used for byte counts; finalises late on spawn).
     try:
         resp = s3.get_object(Bucket=bucket, Key=trace_key)
         lines = resp["Body"].read().decode().splitlines()
@@ -86,12 +125,30 @@ while True:
     # Pipeline is running while run_pipeline.sh is alive OR the exit file is unwritten.
     pipeline_done = os.path.exists("/tmp/nf-head/pipeline.exit")
     nf_running = not pipeline_done and os.path.exists(f"/proc/{nf_pid}")
-    tasks = read_trace()
 
-    running = sum(1 for t in tasks if t.get("status") == "RUNNING")
-    done = sum(1 for t in tasks if t.get("status") == "COMPLETED")
-    failed = sum(1 for t in tasks if t.get("status") in ("FAILED", "ABORTED"))
-    total = len(tasks)
+    # LIVE counts from .nextflow.log (real-time), restricted to the per-sample
+    # CALL_VARIANTS fan-out — that's the "N genomes" the audience watches. The
+    # downstream MERGE_VCFS/VCF_STATS are single tasks shown as separate phases.
+    submitted, completed, failed_set = read_log_tasks()
+    call_sub = {t for t in submitted if is_call_task(t)}
+    call_done = {t for t in completed if is_call_task(t)}
+    done = len(call_done)
+    running = len(call_sub - call_done)
+    failed = len({t for t in failed_set if is_call_task(t)})
+    total = len(sample_list)  # known sample count — the denominator stays fixed
+
+    # Per-super-population genomes-done, so the feed can say which populations are
+    # landing (e.g. "AFR 8/10"). Sample name is "CALL_VARIANTS (HG01879)".
+    def _sample_of(name):
+        m = re.search(r"\(([^)]+)\)", name)
+        return m.group(1) if m else ""
+
+    pop_done: dict = {}
+    for t in call_done:
+        sp = pop_map.get(_sample_of(t), "unknown")
+        pop_done[sp] = pop_done.get(sp, 0) + 1
+
+    tasks = read_trace()  # still used for byte volumes (below)
 
     # ── Cost: integrate the burn rate over this poll interval ────────────────
     # At each tick, the instantaneous burn is the head + every currently-RUNNING
@@ -102,7 +159,7 @@ while True:
     now = time.time()
     dt_hr = (now - last_tick) / 3600.0
     last_tick = now
-    cost_usd += (HEAD_RATE_USD_HR + running * TASK_RATE_USD_HR) * dt_hr
+    cost_usd += (HEAD_RATE_USD_HR + running * TASK_RATE_USD_HR + FSX_RATE_USD_HR) * dt_hr
 
     # Data volumes from the trace rchar/wchar fields on the CALL_VARIANTS tasks.
     call_tasks = [t for t in tasks if is_call_task(t.get("name", ""))]
@@ -117,6 +174,7 @@ while True:
         "tasks_running": running,
         "tasks_done": done,
         "tasks_failed": failed,
+        "pop_done": pop_done,  # {super_pop: genomes_called} for live feed context
         "bam_bytes_read": bam_bytes,
         "vcf_bytes": vcf_bytes,
         "ec2_cost_usd": round(cost_usd, 6),

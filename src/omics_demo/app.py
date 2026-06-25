@@ -83,6 +83,10 @@ else:
 
 _STATE: dict[str, Any] = {
     "status": "idle",  # idle | running | complete | error
+    # Infrastructure lifecycle, independent of a run's status, so the page can
+    # gate Start on a provisioned FSx: not_provisioned | provisioning |
+    # provisioned | tearing_down. Drives the speaker console's button states.
+    "infra": "not_provisioned",
     "run_id": None,
     "start_time": None,
     "head_instance_id": None,
@@ -148,11 +152,47 @@ async def start_run():
     return {"status": "started", "run_id": _STATE["run_id"], "fake": _FAKE}
 
 
+@app.post("/api/provision")
+async def provision_infra():
+    """Provision the FSx filesystem for the run (green-room step, ~10-15 min).
+
+    Gates Start: the page enables Start only once infra == 'provisioned'.
+    """
+    with _STATE_LOCK:
+        if _STATE["infra"] in ("provisioning", "provisioned"):
+            return {"status": _STATE["infra"]}
+        _STATE["infra"] = "provisioning"
+    threading.Thread(target=_run_provision, daemon=True).start()
+    return {"status": "provisioning", "fake": _FAKE}
+
+
+@app.post("/api/reset")
+async def reset_run():
+    """Clear the last run (S3 results + stragglers) but KEEP FSx — rehearse→reset→live."""
+    threading.Thread(target=_run_reset, daemon=True).start()
+    with _STATE_LOCK:
+        _STATE["status"] = "idle"
+        _STATE["progress"] = None
+        _STATE["summary"] = None
+        _STATE["error"] = None
+    return {"status": "resetting", "fake": _FAKE}
+
+
+@app.post("/api/teardown")
+async def teardown_infra():
+    """Delete FSx + terminate demo instances (after the talk). Always available."""
+    with _STATE_LOCK:
+        _STATE["infra"] = "tearing_down"
+    threading.Thread(target=_run_teardown, daemon=True).start()
+    return {"status": "tearing_down", "fake": _FAKE}
+
+
 @app.get("/api/status")
 async def get_status():
     with _STATE_LOCK:
         return {
             "status": _STATE["status"],
+            "infra": _STATE["infra"],
             "run_id": _STATE["run_id"],
             "queue_size": _STATE["queue_size"],
             "progress": _STATE["progress"],
@@ -236,6 +276,63 @@ def _validate_config(config) -> str | None:
 # ---------------------------------------------------------------------------
 # Real pipeline runner (background thread)
 # ---------------------------------------------------------------------------
+
+
+def _run_provision() -> None:
+    """Provision FSx (real or simulated), then flip infra → provisioned + set FSX_ID."""
+    if _FAKE:
+        import time as _t
+
+        for label in (
+            "Provisioning FSx for Lustre (shared reference)…",
+            "FSx creating — waiting for AVAILABLE…",
+            "FSx AVAILABLE — infrastructure ready. Press Start to run.",
+        ):
+            _broadcast({"type": "phase", "label": label})
+            _t.sleep(1.2)
+        _broadcast({"type": "provisioned", "fsx_id": "fs-fake000000"})
+        with _STATE_LOCK:
+            _STATE["infra"] = "provisioned"
+        return
+
+    from . import lifecycle
+
+    fs_id = lifecycle.provision(cfg, emit=_broadcast)
+    with _STATE_LOCK:
+        if fs_id:
+            cfg.FSX_ID = fs_id  # so Start uses the freshly-provisioned FS
+            _STATE["infra"] = "provisioned"
+        else:
+            _STATE["infra"] = "not_provisioned"
+
+
+def _run_reset() -> None:
+    """Clear the run, keep FSx. Real path delegates to lifecycle.reset."""
+    if _FAKE:
+        _broadcast({"type": "phase", "label": "Reset complete — ready to run again."})
+        _broadcast({"type": "reset_done", "cleared_prefixes": [], "instances_terminated": []})
+        return
+    from . import lifecycle
+
+    lifecycle.reset(cfg, emit=_broadcast)
+
+
+def _run_teardown() -> None:
+    """Delete FSx + terminate instances. Real path delegates to lifecycle.teardown."""
+    if _FAKE:
+        _broadcast({"type": "phase", "label": "Teardown: deleting FSx + instances…"})
+        _broadcast(
+            {"type": "teardown_done", "fsx_deleted": "fs-fake000000", "instances_terminated": []}
+        )
+        with _STATE_LOCK:
+            _STATE["infra"] = "not_provisioned"
+        return
+    from . import lifecycle
+
+    lifecycle.teardown(cfg, emit=_broadcast)
+    with _STATE_LOCK:
+        cfg.FSX_ID = ""
+        _STATE["infra"] = "not_provisioned"
 
 
 def _run_pipeline() -> None:
@@ -478,6 +575,11 @@ def _run_fake_pipeline() -> None:
             bam_gb = done * 0.3  # ~0.3 GB chr20 low-coverage BAM streamed per sample
             vcf_gb = bam_gb * 0.008  # tiny chr20 VCF (BAM streams through)
 
+            # Genomes-done split evenly across the 3 super-pops (rehearsal mirror of
+            # the real monitor's pop_done, so the "Genomes called (live)" panel animates).
+            per = done // 3
+            pop_done = {"AFR": per + (done % 3 > 0), "EUR": per + (done % 3 > 1), "EAS": per}
+
             emit(
                 {
                     "type": "progress",
@@ -494,6 +596,7 @@ def _run_fake_pipeline() -> None:
                     "vcf_gb": vcf_gb,
                     "compression_ratio": (bam_gb / vcf_gb) if vcf_gb > 0 else 0,
                     "variant_counts": variant_counts,
+                    "pop_done": pop_done,
                 }
             )
             time.sleep(1.0)
@@ -607,6 +710,7 @@ def _poll_until_done(
                 "compression_ratio": prog.data.compression_ratio,
                 "reference_gb": prog.data.reference_bytes_read / 1e9,
                 "variant_counts": prog.variant_counts,
+                "pop_done": prog.pop_done,
             }
         )
 

@@ -228,6 +228,7 @@ def main() -> None:
                     "elapsed_seconds": prog.elapsed_seconds,
                     "bam_gb": prog.data.bam_gb,
                     "vcf_gb": prog.data.vcf_gb,
+                    "pop_done": prog.pop_done,
                 }
             )
 

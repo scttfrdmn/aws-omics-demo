@@ -66,6 +66,7 @@ class PipelineProgress:
     ec2_cost_usd: float = 0.0
     data: DataVolume = field(default_factory=DataVolume)
     variant_counts: dict[str, list[str]] = field(default_factory=dict)
+    pop_done: dict[str, int] = field(default_factory=dict)  # {super_pop: genomes called}
 
     @property
     def concurrency_pct(self) -> float:
@@ -128,6 +129,7 @@ def poll_progress(cfg, start_time: float, queue_size: int) -> PipelineProgress:
     )
 
     p.variant_counts = _sample_variants(s3, cfg.BUCKET, cfg.JOB_NAME)
+    p.pop_done = raw.get("pop_done") or {}  # written live by the head monitor
 
     return p
 
