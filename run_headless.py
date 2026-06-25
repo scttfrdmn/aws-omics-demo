@@ -248,11 +248,20 @@ def main() -> None:
             sys.exit(1)
 
         # 6. Synthesis
-        summary = pipeline.read_summary(cfg)
+        # The head writes summary.json a few seconds AFTER its monitor flips
+        # progress.json to status=complete (which is what pipeline_done keys on),
+        # so summary.json may not exist the instant we get here. Retry briefly
+        # before giving up rather than racing the head's final write.
+        summary = None
+        for _ in range(12):  # up to ~60s
+            summary = pipeline.read_summary(cfg)
+            if summary:
+                break
+            time.sleep(5)
         if summary:
             agent.synthesize(summary, emit)
         else:
-            emit({"type": "error", "message": "No summary.json found in S3."})
+            emit({"type": "error", "message": "No summary.json found in S3 after 60s."})
             sys.exit(1)
     finally:
         # Always remove this job's s3:// reference marker.
